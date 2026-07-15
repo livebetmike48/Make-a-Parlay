@@ -48,6 +48,7 @@ def get_today_slate() -> list[dict]:
                 team = g["teams"][side]
                 probable = team.get("probablePitcher") or {}
                 entry["teams"][side] = {
+                    "team_id": (team.get("team") or {}).get("id"),
                     "abbrev": (team.get("team") or {}).get("abbreviation", "?"),
                     "name": (team.get("team") or {}).get("name", "?"),
                     "starter_id": probable.get("id"),
@@ -246,3 +247,118 @@ def pick_one_per_game(legs: list[dict], game_of: dict, count: int) -> list[dict]
         if len(chosen) >= count:
             break
     return chosen
+
+
+# ---------- moneyline / totals (game-level markets) ----------
+
+_team_runs_cache: dict = {}
+
+
+def _runs_from_schedule_games(games: list[dict], team_id: int, last_n: int = 10) -> dict | None:
+    """Pure helper: runs scored/allowed per game from finished schedule
+    entries (testable without network)."""
+    finished = []
+    for g in games:
+        if g.get("status", {}).get("abstractGameState") != "Final":
+            continue
+        for side, opp in (("home", "away"), ("away", "home")):
+            t = g["teams"][side]
+            if (t.get("team") or {}).get("id") == team_id:
+                scored = t.get("score")
+                allowed = g["teams"][opp].get("score")
+                if scored is not None and allowed is not None:
+                    finished.append((g.get("officialDate", ""), scored, allowed))
+    if not finished:
+        return None
+    finished.sort(key=lambda x: x[0])
+    recent = finished[-last_n:]
+    n = len(recent)
+    return {
+        "runs_pg": round(sum(r[1] for r in recent) / n, 2),
+        "runs_allowed_pg": round(sum(r[2] for r in recent) / n, 2),
+        "games": n,
+    }
+
+
+def get_team_recent_runs(team_id: int, last_n: int = 10) -> dict | None:
+    today = et_date_str(0)
+    key = (team_id, today)
+    if key in _team_runs_cache:
+        return _team_runs_cache[key]
+    start = (datetime.now(timezone.utc) - timedelta(days=25)).strftime("%Y-%m-%d")
+    resp = requests.get(
+        f"{MLB_BASE}/schedule",
+        params={"sportId": 1, "teamId": team_id, "startDate": start, "endDate": today},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    games = []
+    for d in resp.json().get("dates", []):
+        games.extend(d.get("games", []))
+    result = _runs_from_schedule_games(games, team_id, last_n)
+    _team_runs_cache[key] = result
+    return result
+
+
+def _starter_overall(starter_id: int) -> dict | None:
+    """Starter's season line vs all batters (validated core stats)."""
+    try:
+        rows = get_player_season_rows(starter_id, True)
+    except Exception:
+        return None
+    if not rows:
+        return None
+    stats = statcast_api._core_stats(rows)
+    return stats if stats.get("pa", 0) >= 100 else None
+
+
+def evaluate_moneyline_leg(game: dict) -> dict | None:
+    """Pick the side whose starter has the better (lower) xwOBA-against.
+    Ranked by the real gap between the two starters -- no composite scores."""
+    sides = {}
+    for side in ("home", "away"):
+        t = game["teams"][side]
+        if not t["starter_id"]:
+            return None
+        stats = _starter_overall(t["starter_id"])
+        if not stats or stats.get("xwoba") is None:
+            return None
+        runs = get_team_recent_runs(t["team_id"]) if t.get("team_id") else None
+        sides[side] = {"team": t, "starter_stats": stats, "runs": runs}
+
+    home_x = sides["home"]["starter_stats"]["xwoba"]
+    away_x = sides["away"]["starter_stats"]["xwoba"]
+    pick_side = "home" if home_x < away_x else "away"
+    opp_side = "away" if pick_side == "home" else "home"
+    pick, opp = sides[pick_side], sides[opp_side]
+    return {
+        "pick_team": pick["team"]["name"], "pick_abbrev": pick["team"]["abbrev"],
+        "opp_team": opp["team"]["name"],
+        "pick_starter": pick["team"]["starter_name"], "opp_starter": opp["team"]["starter_name"],
+        "pick_xwoba": pick["starter_stats"]["xwoba"], "opp_xwoba": opp["starter_stats"]["xwoba"],
+        "pick_k": pick["starter_stats"].get("k_pct"), "opp_k": opp["starter_stats"].get("k_pct"),
+        "pick_runs": pick["runs"], "opp_runs": opp["runs"],
+        "rank_metric": round(opp["starter_stats"]["xwoba"] - pick["starter_stats"]["xwoba"], 3),
+    }
+
+
+def evaluate_total_leg(game: dict) -> dict | None:
+    """Run environment for a game: combined recent runs/game of both teams
+    (the ranking metric -- a real frequency), with both starters' quality
+    shown as context. No betting line involved; you compare vs your book."""
+    teams = []
+    combined = 0.0
+    for side in ("home", "away"):
+        t = game["teams"][side]
+        runs = get_team_recent_runs(t["team_id"]) if t.get("team_id") else None
+        if runs is None:
+            return None
+        starter_stats = _starter_overall(t["starter_id"]) if t["starter_id"] else None
+        teams.append({"team": t, "runs": runs, "starter_stats": starter_stats})
+        combined += runs["runs_pg"]
+    return {
+        "matchup": f"{teams[1]['team']['abbrev']} @ {teams[0]['team']['abbrev']}",
+        "teams": teams,
+        "combined_runs_pg": round(combined, 2),
+        "rank_metric": round(combined, 2),
+    }
