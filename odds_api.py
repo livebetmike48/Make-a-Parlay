@@ -35,7 +35,7 @@ def get_mlb_odds(markets: str = "h2h") -> list[dict]:
     try:
         resp = requests.get(
             BASE,
-            params={"apiKey": API_KEY, "regions": "us", "markets": markets, "oddsFormat": "american"},
+            params={"apiKey": API_KEY, "regions": "us", "markets": markets, "oddsFormat": "american", "includeLinks": "true"},
             timeout=20,
         )
         if resp.status_code != 200:
@@ -72,6 +72,25 @@ def find_event(events: list[dict], team_a: str, team_b: str) -> dict | None:
         if (_matches(a, home) and _matches(b, away)) or (_matches(a, away) and _matches(b, home)):
             return ev
     return None
+
+
+def all_prices_and_links(event: dict, market_key: str, outcome_name: str) -> tuple[dict, dict]:
+    """({book: price}, {book: deepest available link}) for one outcome."""
+    prices, links = {}, {}
+    target = _fold(outcome_name)
+    for book in event.get("bookmakers", []) or []:
+        for market in book.get("markets", []) or []:
+            if market.get("key") != market_key:
+                continue
+            for outcome in market.get("outcomes", []) or []:
+                name = _fold(outcome.get("name"))
+                if name and (name in target or target in name):
+                    title = book.get("title", "?")
+                    prices[title] = outcome.get("price")
+                    link = outcome.get("link") or market.get("link") or book.get("link")
+                    if link:
+                        links[title] = link
+    return prices, links
 
 
 def all_prices(event: dict, market_key: str, outcome_name: str) -> dict:
@@ -203,7 +222,7 @@ def get_event_props(event_id: str, market_key: str) -> dict | None:
     try:
         resp = requests.get(
             f"{EVENTS_BASE}/{event_id}/odds",
-            params={"apiKey": API_KEY, "regions": "us", "markets": market_key, "oddsFormat": "american"},
+            params={"apiKey": API_KEY, "regions": "us", "markets": market_key, "oddsFormat": "american", "includeLinks": "true"},
             timeout=20,
         )
         if resp.status_code != 200:
@@ -241,13 +260,18 @@ def player_prop_prices(event_data: dict, market_key: str, player_name: str) -> d
                 if not desc or (target not in desc and target_last not in desc):
                     continue
                 pt = outcome.get("point")
-                bucket = by_point.setdefault(pt, {})
-                bucket[book.get("title", "?")] = outcome.get("price")
+                bucket = by_point.setdefault(pt, {"prices": {}, "links": {}})
+                title = book.get("title", "?")
+                bucket["prices"][title] = outcome.get("price")
+                link = outcome.get("link") or market.get("link") or book.get("link")
+                if link:
+                    bucket["links"][title] = link
     if not by_point:
         return None
     # Hits/HR: want the 0.5 line when present; otherwise most-quoted point
     if market_key in ("batter_hits", "batter_home_runs") and 0.5 in by_point:
         point = 0.5
     else:
-        point = max(by_point, key=lambda p: len(by_point[p]))
-    return {"point": point, "prices": by_point[point]}
+        point = max(by_point, key=lambda p: len(by_point[p]["prices"]))
+    chosen = by_point[point]
+    return {"point": point, "prices": chosen["prices"], "links": chosen["links"]}
