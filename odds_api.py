@@ -53,6 +53,28 @@ def get_mlb_odds(markets: str = "h2h") -> list[dict]:
         return []
 
 
+DEFAULT_STATE = os.getenv("ODDS_LINK_STATE", "ny")
+
+
+def _clean_link(url) -> str | None:
+    """Discord buttons require well-formed absolute URLs. Some books return
+    templated links ({state} subdomains etc.) -- fill what we can, reject
+    the rest so callers fall back to text odds instead of crashing."""
+    if not url or not isinstance(url, str):
+        return None
+    url = url.replace("{state}", DEFAULT_STATE).replace("{STATE}", DEFAULT_STATE)
+    if "{" in url or "}" in url or " " in url:
+        return None  # unfilled template -- unusable
+    from urllib.parse import urlparse
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return None
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return None
+    return url
+
+
 def _fold(text: str) -> str:
     text = unicodedata.normalize("NFKD", text or "")
     return "".join(ch for ch in text if not unicodedata.combining(ch)).lower().strip()
@@ -87,7 +109,7 @@ def all_prices_and_links(event: dict, market_key: str, outcome_name: str) -> tup
                 if name and (name in target or target in name):
                     title = book.get("title", "?")
                     prices[title] = outcome.get("price")
-                    link = outcome.get("link") or market.get("link") or book.get("link")
+                    link = _clean_link(outcome.get("link") or market.get("link") or book.get("link"))
                     if link:
                         links[title] = link
     return prices, links
@@ -263,7 +285,7 @@ def player_prop_prices(event_data: dict, market_key: str, player_name: str) -> d
                 bucket = by_point.setdefault(pt, {"prices": {}, "links": {}})
                 title = book.get("title", "?")
                 bucket["prices"][title] = outcome.get("price")
-                link = outcome.get("link") or market.get("link") or book.get("link")
+                link = _clean_link(outcome.get("link") or market.get("link") or book.get("link"))
                 if link:
                     bucket["links"][title] = link
     if not by_point:
