@@ -47,6 +47,17 @@ def _leg_lines(leg: dict, market: str) -> str:
     return "\n".join(lines)
 
 
+def build_bet_buttons(leg_links: list[tuple[str, str]]) -> discord.ui.View | None:
+    """Link buttons: [('Leg 1: Soto @ BetRivers', url), ...]. Discord caps
+    at 25 buttons; we stay well under. None if no book gave us links."""
+    if not leg_links:
+        return None
+    view = discord.ui.View()
+    for label, url in leg_links[:25]:
+        view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label=label[:80], url=url))
+    return view
+
+
 class ParlayBot(discord.Client):
     def __init__(self):
         super().__init__(intents=intents)
@@ -213,6 +224,7 @@ class ParlayBot(discord.Client):
         embed.description = cfg["note"] + " • best legs win, any game"
         best_leg_prices = []
         leg_games = set()
+        bet_buttons = []
         for i, leg in enumerate(chosen, 1):
             value = _leg_lines(leg, market)
             priced = leg.get("_priced") or await asyncio.to_thread(_price_leg, leg)
@@ -223,6 +235,9 @@ class ParlayBot(discord.Client):
                 if bp:
                     best_leg_prices.append(bp[1])
                     leg_games.add(game_of.get(id(leg)))
+                    link = (priced.get("links") or {}).get(bp[0])
+                    if link:
+                        bet_buttons.append((f"Leg {i}: {leg['batter'].split()[-1]} {bp[1]:+d} @ {bp[0]}", link))
             embed.add_field(
                 name=f"Leg {i}: {leg['batter']} ({leg['team']})",
                 value=value,
@@ -236,7 +251,11 @@ class ParlayBot(discord.Client):
             else:
                 embed.add_field(name="Parlay pricing", value="Includes same-game legs — your book prices the correlation, so no naive multiplied payout shown.", inline=False)
         embed.set_footer(text="Research, not advice — confirm lineups before betting • Data: Baseball Savant / MLB / The Odds API")
-        await interaction.followup.send(embed=embed)
+        view = build_bet_buttons(bet_buttons)
+        if view:
+            await interaction.followup.send(embed=embed, view=view)
+        else:
+            await interaction.followup.send(embed=embed)
 
     async def _strikeouts_callback(self, interaction: discord.Interaction, legs: LegsT = 3):
         await interaction.response.defer()
@@ -275,6 +294,7 @@ class ParlayBot(discord.Client):
 
         embed = discord.Embed(title=f"⚔️ Strikeouts Parlay — {len(chosen)} legs", color=discord.Color.red())
         embed.description = "ranked by real K% vs either side"
+        bet_buttons = []
         for i, leg in enumerate(chosen, 1):
             value = (f"K%: {leg['k_pct_vs_l']}% vs L | {leg['k_pct_vs_r']}% vs R\n"
                      f"Whiff%: {leg['whiff_vs_l']}% vs L | {leg['whiff_vs_r']}% vs R\n"
@@ -287,13 +307,21 @@ class ParlayBot(discord.Client):
                     priced = odds_api.player_prop_prices(props, "pitcher_strikeouts", leg["starter"]) if props else None
                     if priced:
                         value += f"\nK line {priced['point']} — over: " + odds_api.format_prices(priced["prices"])
+                        bp = odds_api.best_price(priced["prices"])
+                        link = (priced.get("links") or {}).get(bp[0]) if bp else None
+                        if bp and link:
+                            bet_buttons.append((f"Leg {i}: {leg['starter'].split()[-1]} O{priced['point']} @ {bp[0]}", link))
             embed.add_field(
                 name=f"Leg {i}: {leg['starter']} ({leg['team']}) vs {leg['opponent']}",
                 value=value,
                 inline=False,
             )
-        embed.set_footer(text="Research, not advice — K prop lines vary by book • Data: Baseball Savant / MLB")
-        await interaction.followup.send(embed=embed)
+        embed.set_footer(text="Research, not advice — K prop lines vary by book • Data: Baseball Savant / MLB / The Odds API")
+        view = build_bet_buttons(bet_buttons)
+        if view:
+            await interaction.followup.send(embed=embed, view=view)
+        else:
+            await interaction.followup.send(embed=embed)
 
     async def _streak_callback(self, interaction: discord.Interaction,
                                 min_streak: Literal[3, 4, 5, 6, 7, 8, 10] = 5,
@@ -432,6 +460,7 @@ class ParlayBot(discord.Client):
         chosen = parlay.pick_legs(evaluated, game_of, legs, max_per_game=1)
 
         best_leg_prices = []
+        bet_buttons = []
         embed = discord.Embed(title=f"💰 Moneyline Parlay — {len(chosen)} legs", color=discord.Color.green())
         embed.description = "ranked by real starter xwOBA-against gap • one leg per game"
         for i, leg in enumerate(chosen, 1):
@@ -446,12 +475,14 @@ class ParlayBot(discord.Client):
                 )
             event = odds_api.find_event(odds_events, leg["pick_team"], leg["opp_team"]) if odds_events else None
             if event:
-                prices = odds_api.all_prices(event, "h2h", leg["pick_team"])
+                prices, links = odds_api.all_prices_and_links(event, "h2h", leg["pick_team"])
                 if prices:
                     lines.append("Odds: " + odds_api.format_prices(prices))
                     bp = odds_api.best_price(prices)
                     if bp:
                         best_leg_prices.append(bp[1])
+                        if links.get(bp[0]):
+                            bet_buttons.append((f"Leg {i}: {leg['pick_abbrev']} ML {bp[1]:+d} @ {bp[0]}", links[bp[0]]))
             embed.add_field(
                 name=f"Leg {i}: {leg['pick_team']} ML over {leg['opp_team']}",
                 value="\n".join(lines),
@@ -462,7 +493,11 @@ class ParlayBot(discord.Client):
             if combo is not None:
                 embed.add_field(name="Parlay at best prices", value=f"**{combo:+d}**", inline=False)
         embed.set_footer(text="Research, not advice — starter-quality gap, not a win probability • Data: Baseball Savant / MLB / The Odds API")
-        await interaction.followup.send(embed=embed)
+        view = build_bet_buttons(bet_buttons)
+        if view:
+            await interaction.followup.send(embed=embed, view=view)
+        else:
+            await interaction.followup.send(embed=embed)
 
     async def _totals_callback(self, interaction: discord.Interaction,
                                 lean: Literal["overs", "unders"] = "overs",
