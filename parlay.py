@@ -242,20 +242,26 @@ def evaluate_k_leg(starter_id: int, starter_name: str, team: str, opponent: str)
     }
 
 
-def pick_one_per_game(legs: list[dict], game_of: dict, count: int) -> list[dict]:
-    """Classic parlay diversification: best-ranked leg from each distinct
-    game, then top `count` overall."""
+def pick_legs(legs: list[dict], game_of: dict, count: int, max_per_game: int | None = None) -> list[dict]:
+    """Top `count` legs by rank metric. max_per_game=1 restores classic
+    one-leg-per-game diversification; None lets the best legs win even if
+    several come from the same game."""
     legs_sorted = sorted(legs, key=lambda x: -(x.get("rank_metric") or 0))
-    chosen, used_games = [], set()
+    chosen, per_game = [], {}
     for leg in legs_sorted:
         game = game_of.get(id(leg))
-        if game in used_games:
+        if max_per_game is not None and per_game.get(game, 0) >= max_per_game:
             continue
-        used_games.add(game)
+        per_game[game] = per_game.get(game, 0) + 1
         chosen.append(leg)
         if len(chosen) >= count:
             break
     return chosen
+
+
+# Backward-compatible alias
+def pick_one_per_game(legs: list[dict], game_of: dict, count: int) -> list[dict]:
+    return pick_legs(legs, game_of, count, max_per_game=1)
 
 
 # ---------- moneyline / totals (game-level markets) ----------
@@ -400,3 +406,60 @@ def sgp_candidates(game: dict) -> dict:
     k_legs.sort(key=lambda x: -(x.get("rank_metric") or 0))
     hit_legs.sort(key=lambda x: -(x.get("rank_metric") or 0))
     return {"k_legs": k_legs, "hit_legs": hit_legs}
+
+
+def hitting_streak(rows: list[dict]) -> int:
+    """Current ACTIVE hitting streak: consecutive most-recent games with at
+    least one hit, computed from real game logs."""
+    games: dict = {}
+    for r in rows:
+        gpk = r.get("game_pk")
+        date = r.get("game_date")
+        if not gpk or not date:
+            continue
+        key = (date, gpk)
+        games.setdefault(key, False)
+        if r.get("events") in HIT_EVENTS:
+            games[key] = True
+    streak = 0
+    for key in sorted(games.keys(), reverse=True):
+        if games[key]:
+            streak += 1
+        else:
+            break
+    return streak
+
+
+def streak_candidates(slate: list[dict], min_streak: int, cap: int = 30) -> tuple[list[dict], dict]:
+    """Hitters on today's slate with an active hit streak >= min_streak.
+    Legs ranked by streak length (a real count). Returns (legs, game_of)."""
+    legs, game_of = [], {}
+    scanned = 0
+    for g in slate:
+        for side, opp_side in (("home", "away"), ("away", "home")):
+            team = g["teams"][side]
+            opp = g["teams"][opp_side]
+            if not opp["starter_id"]:
+                continue
+            try:
+                hand = get_starter_hand(opp["starter_id"])
+            except Exception:
+                continue
+            if hand not in ("L", "R"):
+                continue
+            for batter in shortlist_hitters([team["abbrev"]], "xba", 3):
+                if scanned >= cap:
+                    break
+                scanned += 1
+                leg = evaluate_hit_leg(batter, opp["starter_id"], opp["starter_name"], hand, "hit")
+                if not leg:
+                    continue
+                rows = get_player_season_rows(batter["player_id"], False)
+                streak = hitting_streak(rows)
+                if streak < min_streak:
+                    continue
+                leg["streak"] = streak
+                leg["rank_metric"] = streak
+                legs.append(leg)
+                game_of[id(leg)] = g["game_pk"]
+    return legs, game_of
