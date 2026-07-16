@@ -225,16 +225,17 @@ class ParlayBot(discord.Client):
         for leg in chosen:
             priced_legs.append(leg.get("_priced") or await asyncio.to_thread(_price_leg, leg))
         by_book = odds_api.parlay_by_book(priced_legs)
+        slips = odds_api.parlay_slips(priced_legs, by_book)
         same_game = len({game_of.get(id(l)) for l in chosen}) < len(chosen)
 
         embed = discord.Embed(title=f"{cfg['title']} — {len(chosen)} legs", color=discord.Color.gold())
         header = ""
         if by_book:
-            best_book = max(by_book, key=lambda bk: by_book[bk]["combined"])
-            header = f"🎟️ **Parlay pays {by_book[best_book]['combined']:+d}** best @ {best_book}"
             if same_game:
-                header += "\n*(same-game legs — your book may reprice the correlation on the slip)*"
-            header += "\n\n"
+                header = "🎟️ **Same-game parlay** — tap a book below to load the full slip; the book shows its exact SGP price there\n\n"
+            else:
+                best_book = max(by_book, key=lambda bk: by_book[bk]["combined"])
+                header = f"🎟️ **Parlay pays {by_book[best_book]['combined']:+d}** best @ {best_book}\n\n"
         embed.description = header + cfg["note"] + " • best legs win, any game"
         for i, leg in enumerate(chosen, 1):
             embed.add_field(
@@ -243,12 +244,17 @@ class ParlayBot(discord.Client):
                 inline=False,
             )
         embed.set_footer(text="Research, not advice — confirm lineups before betting • Data: Baseball Savant / MLB / The Odds API")
-        bet_buttons = [
-            (f"{bk} {by_book[bk]['combined']:+d}", by_book[bk]["link"])
-            for bk in sorted(by_book, key=lambda bk: -by_book[bk]["combined"])
-            if by_book[bk]["link"]
-        ][:5]
-        view = build_bet_buttons(bet_buttons)
+        bet_buttons = []
+        for bk in sorted(by_book, key=lambda bk: -by_book[bk]["combined"]):
+            url = slips.get(bk) or by_book[bk]["link"]
+            if not url:
+                continue
+            if bk in slips:
+                label = f"Full slip @ {bk}" if same_game else f"Full slip @ {bk} {by_book[bk]['combined']:+d}"
+            else:
+                label = f"{bk} (build slip)" if same_game else f"{bk} {by_book[bk]['combined']:+d} (build slip)"
+            bet_buttons.append((label, url))
+        view = build_bet_buttons(bet_buttons[:5])
         if view:
             await interaction.followup.send(embed=embed, view=view)
         else:
@@ -302,16 +308,17 @@ class ParlayBot(discord.Client):
             if priced:
                 k_lines[id(leg)] = priced["point"]
         by_book = odds_api.parlay_by_book(priced_legs)
+        slips = odds_api.parlay_slips(priced_legs, by_book)
         same_game = len({game_of.get(id(l)) for l in chosen}) < len(chosen)
 
         embed = discord.Embed(title=f"⚔️ Strikeouts Parlay — {len(chosen)} legs", color=discord.Color.red())
         header = ""
         if by_book:
-            best_book = max(by_book, key=lambda bk: by_book[bk]["combined"])
-            header = f"🎟️ **Overs parlay pays {by_book[best_book]['combined']:+d}** best @ {best_book}"
             if same_game:
-                header += "\n*(same-game legs — your book may reprice the correlation on the slip)*"
-            header += "\n\n"
+                header = "🎟️ **Same-game parlay** — tap a book below to load the full slip; the book shows its exact SGP price there\n\n"
+            else:
+                best_book = max(by_book, key=lambda bk: by_book[bk]["combined"])
+                header = f"🎟️ **Overs parlay pays {by_book[best_book]['combined']:+d}** best @ {best_book}\n\n"
         embed.description = header + "ranked by real K% vs either side"
         for i, leg in enumerate(chosen, 1):
             value = (f"K%: {leg['k_pct_vs_l']}% vs L | {leg['k_pct_vs_r']}% vs R\n"
@@ -324,11 +331,17 @@ class ParlayBot(discord.Client):
                 value=value,
                 inline=False,
             )
-        bet_buttons = [
-            (f"{bk} {by_book[bk]['combined']:+d}", by_book[bk]["link"])
-            for bk in sorted(by_book, key=lambda bk: -by_book[bk]["combined"])
-            if by_book[bk]["link"]
-        ][:5]
+        bet_buttons = []
+        for bk in sorted(by_book, key=lambda bk: -by_book[bk]["combined"]):
+            url = slips.get(bk) or by_book[bk]["link"]
+            if not url:
+                continue
+            if bk in slips:
+                label = f"Full slip @ {bk}" if same_game else f"Full slip @ {bk} {by_book[bk]['combined']:+d}"
+            else:
+                label = f"{bk} (build slip)" if same_game else f"{bk} {by_book[bk]['combined']:+d} (build slip)"
+            bet_buttons.append((label, url))
+        bet_buttons = bet_buttons[:5]
         embed.set_footer(text="Research, not advice — K prop lines vary by book • Data: Baseball Savant / MLB / The Odds API")
         view = build_bet_buttons(bet_buttons)
         if view:
@@ -504,11 +517,17 @@ class ParlayBot(discord.Client):
                 inline=False,
             )
         embed.set_footer(text="Research, not advice — starter-quality gap, not a win probability • Data: Baseball Savant / MLB / The Odds API")
-        bet_buttons = [
-            (f"{bk} {by_book[bk]['combined']:+d}", by_book[bk]["link"])
-            for bk in sorted(by_book, key=lambda bk: -by_book[bk]["combined"])
-            if by_book[bk]["link"]
-        ][:5]
+        bet_buttons = []
+        for bk in sorted(by_book, key=lambda bk: -by_book[bk]["combined"]):
+            url = slips.get(bk) or by_book[bk]["link"]
+            if not url:
+                continue
+            if bk in slips:
+                label = f"Full slip @ {bk}" if same_game else f"Full slip @ {bk} {by_book[bk]['combined']:+d}"
+            else:
+                label = f"{bk} (build slip)" if same_game else f"{bk} {by_book[bk]['combined']:+d} (build slip)"
+            bet_buttons.append((label, url))
+        bet_buttons = bet_buttons[:5]
         view = build_bet_buttons(bet_buttons)
         if view:
             await interaction.followup.send(embed=embed, view=view)
