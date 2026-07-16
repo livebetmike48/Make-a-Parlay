@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 
 import parlay
 import statcast_api
+import odds_api
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -239,6 +240,9 @@ class ParlayBot(discord.Client):
             return
 
         chosen = parlay.pick_one_per_game(evaluated, game_of, legs)
+        odds_events = await asyncio.to_thread(odds_api.get_mlb_odds, "h2h")
+
+        best_leg_prices = []
         embed = discord.Embed(title=f"💰 Moneyline Parlay — {len(chosen)} legs", color=discord.Color.green())
         embed.description = "ranked by real starter xwOBA-against gap • one leg per game"
         for i, leg in enumerate(chosen, 1):
@@ -251,12 +255,24 @@ class ParlayBot(discord.Client):
                     f"Last 10 runs/gm: {leg['pick_abbrev']} {leg['pick_runs']['runs_pg']} scored / {leg['pick_runs']['runs_allowed_pg']} allowed"
                     f" • opp {leg['opp_runs']['runs_pg']} / {leg['opp_runs']['runs_allowed_pg']}"
                 )
+            event = odds_api.find_event(odds_events, leg["pick_team"], leg["opp_team"]) if odds_events else None
+            if event:
+                prices = odds_api.all_prices(event, "h2h", leg["pick_team"])
+                if prices:
+                    lines.append("Odds: " + odds_api.format_prices(prices))
+                    bp = odds_api.best_price(prices)
+                    if bp:
+                        best_leg_prices.append(bp[1])
             embed.add_field(
                 name=f"Leg {i}: {leg['pick_team']} ML over {leg['opp_team']}",
                 value="\n".join(lines),
                 inline=False,
             )
-        embed.set_footer(text="Research, not advice — starter-quality gap, not a win probability • Data: Baseball Savant / MLB")
+        if len(best_leg_prices) == len(chosen) and best_leg_prices:
+            combo = odds_api.parlay_price(best_leg_prices)
+            if combo is not None:
+                embed.add_field(name="Parlay at best prices", value=f"**{combo:+d}**", inline=False)
+        embed.set_footer(text="Research, not advice — starter-quality gap, not a win probability • Data: Baseball Savant / MLB / The Odds API")
         await interaction.followup.send(embed=embed)
 
     async def _totals_callback(self, interaction: discord.Interaction,
@@ -285,17 +301,30 @@ class ParlayBot(discord.Client):
             return
 
         chosen = parlay.pick_one_per_game(evaluated, game_of, legs)
+        odds_events = await asyncio.to_thread(odds_api.get_mlb_odds, "totals")
         arrow = "⬆️" if lean == "overs" else "⬇️"
         embed = discord.Embed(title=f"{arrow} Totals Leans ({lean}) — {len(chosen)} games", color=discord.Color.blue())
         embed.description = "ranked by combined runs/gm (last 10) • starters shown for context"
         for i, leg in enumerate(chosen, 1):
             lines = [f"Combined recent scoring: {leg['combined_runs_pg']} runs/gm"]
+            if odds_events:
+                names = [t["team"]["name"] for t in leg["teams"]]
+                event = odds_api.find_event(odds_events, names[0], names[1])
+                if event:
+                    tl = odds_api.totals_line(event)
+                    if tl:
+                        side_prices = tl["over"] if lean == "overs" else tl["under"]
+                        bp = odds_api.best_price(side_prices)
+                        bp_str = f" ({lean[:-1]} {bp[1]:+d} @ {bp[0]})" if bp else ""
+                        lines.append(f"Posted line: {tl['point']}{bp_str}")
             for t in leg["teams"]:
                 s = t["starter_stats"]
                 starter_bit = f" — {t['team']['starter_name']} xwOBA-against {s['xwoba']}" if s and s.get("xwoba") is not None else ""
                 lines.append(f"{t['team']['abbrev']}: {t['runs']['runs_pg']} scored / {t['runs']['runs_allowed_pg']} allowed{starter_bit}")
             embed.add_field(name=f"{i}. {leg['matchup']}", value="\n".join(lines), inline=False)
-        embed.set_footer(text="No betting line connected — compare these environments against YOUR book's total • Data: MLB / Baseball Savant")
+        footer = ("Data: MLB / Baseball Savant / The Odds API" if odds_events
+                  else "No totals lines on current odds plan — compare vs your book • Data: MLB / Baseball Savant")
+        embed.set_footer(text=footer)
         await interaction.followup.send(embed=embed)
 
     async def on_ready(self):
