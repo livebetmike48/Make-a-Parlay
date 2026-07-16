@@ -297,3 +297,26 @@ def player_prop_prices(event_data: dict, market_key: str, player_name: str) -> d
         point = max(by_point, key=lambda p: len(by_point[p]["prices"]))
     chosen = by_point[point]
     return {"point": point, "prices": chosen["prices"], "links": chosen["links"]}
+
+
+def parlay_by_book(priced_legs: list[dict]) -> dict:
+    """Combined parlay price PER BOOK, only for books that price EVERY leg.
+    priced_legs: [{'prices': {book: price}, 'links': {book: url}}, ...]
+    Returns {book: {'combined': american_int, 'link': first_available_url}}."""
+    if not priced_legs or any(not p or not p.get("prices") for p in priced_legs):
+        return {}
+    books = set(priced_legs[0]["prices"])
+    for p in priced_legs[1:]:
+        books &= set(p["prices"])
+    out = {}
+    for book in books:
+        dec = 1.0
+        for p in priced_legs:
+            dec *= american_to_decimal(p["prices"][book])
+        link = None
+        for p in priced_legs:
+            link = (p.get("links") or {}).get(book)
+            if link:
+                break
+        out[book] = {"combined": decimal_to_american(dec), "link": link}
+    return out
