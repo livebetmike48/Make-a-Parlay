@@ -3,6 +3,9 @@ import logging
 import asyncio
 from typing import Literal
 
+LegsT = Literal[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+PerGameT = Literal["multiple allowed", "one per game"]
+
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
@@ -67,6 +70,13 @@ class ParlayBot(discord.Client):
             )
             self.tree.add_command(cmd)
 
+        streak_cmd = app_commands.Command(
+            name="streakparlay",
+            description="Parlay every hitter on today's slate riding an active hit streak",
+            callback=self._streak_callback,
+        )
+        self.tree.add_command(streak_cmd)
+
         sgp_cmd = app_commands.Command(
             name="samegameparlay",
             description="Build a same-game parlay: 1 strikeouts leg + hit legs from one game",
@@ -110,11 +120,14 @@ class ParlayBot(discord.Client):
             log.error("Slash command sync failed: %s", e)
 
     def _make_batter_callback(self, market: str):
-        async def callback(interaction: discord.Interaction, legs: Literal[2, 3, 4, 5] = 3):
-            await self._batter_parlay(interaction, market, legs)
+        async def callback(interaction: discord.Interaction, legs: LegsT = 3,
+                           per_game: PerGameT = "multiple allowed",
+                           min_odds: int = None, max_odds: int = None):
+            await self._batter_parlay(interaction, market, legs, per_game, min_odds, max_odds)
         return callback
 
-    async def _batter_parlay(self, interaction: discord.Interaction, market: str, legs: int):
+    async def _batter_parlay(self, interaction: discord.Interaction, market: str, legs: int,
+                              per_game: str = "multiple allowed", min_odds: int = None, max_odds: int = None):
         await interaction.response.defer()
         cfg = MARKET_CONFIG[market]
         try:
@@ -167,10 +180,13 @@ class ParlayBot(discord.Client):
             await interaction.followup.send("Couldn't build qualified legs from today's matchups.")
             return
 
-        chosen = parlay.pick_one_per_game(evaluated, game_of, legs)
+        cap = 1 if per_game == "one per game" else None
+        chosen = parlay.pick_legs(evaluated, game_of, legs, max_per_game=cap)
 
         embed = discord.Embed(title=f"{cfg['title']} — {len(chosen)} legs", color=discord.Color.gold())
-        embed.description = cfg["note"] + " • one leg per game"
+        embed.description = cfg["note"] + (" • one leg per game" if cap else " • best legs win, same game allowed")
+        if min_odds is not None or max_odds is not None:
+            embed.description += "\n(odds filters apply once prop pricing is on your Odds API plan)"
         for i, leg in enumerate(chosen, 1):
             embed.add_field(
                 name=f"Leg {i}: {leg['batter']} ({leg['team']})",
@@ -180,7 +196,8 @@ class ParlayBot(discord.Client):
         embed.set_footer(text="Research, not advice — confirm lineups before betting • Data: Baseball Savant / MLB")
         await interaction.followup.send(embed=embed)
 
-    async def _strikeouts_callback(self, interaction: discord.Interaction, legs: Literal[2, 3, 4, 5] = 3):
+    async def _strikeouts_callback(self, interaction: discord.Interaction, legs: LegsT = 3,
+                                    per_game: PerGameT = "multiple allowed"):
         await interaction.response.defer()
         try:
             slate = await asyncio.to_thread(parlay.get_today_slate)
@@ -211,10 +228,11 @@ class ParlayBot(discord.Client):
             await interaction.followup.send("No probable starters with enough data yet -- try closer to game time.")
             return
 
-        chosen = parlay.pick_one_per_game(evaluated, game_of, legs)
+        cap = 1 if per_game == "one per game" else None
+        chosen = parlay.pick_legs(evaluated, game_of, legs, max_per_game=cap)
 
         embed = discord.Embed(title=f"⚔️ Strikeouts Parlay — {len(chosen)} legs", color=discord.Color.red())
-        embed.description = "ranked by real K% vs either side • one leg per game"
+        embed.description = "ranked by real K% vs either side" + (" • one leg per game" if cap else "")
         for i, leg in enumerate(chosen, 1):
             embed.add_field(
                 name=f"Leg {i}: {leg['starter']} ({leg['team']}) vs {leg['opponent']}",
@@ -224,6 +242,38 @@ class ParlayBot(discord.Client):
                 inline=False,
             )
         embed.set_footer(text="Research, not advice — K prop lines vary by book • Data: Baseball Savant / MLB")
+        await interaction.followup.send(embed=embed)
+
+    async def _streak_callback(self, interaction: discord.Interaction,
+                                min_streak: Literal[3, 4, 5, 6, 7, 8, 10] = 5,
+                                legs: LegsT = 5):
+        await interaction.response.defer()
+        try:
+            slate = await asyncio.to_thread(parlay.get_today_slate)
+        except Exception as e:
+            await interaction.followup.send(f"Couldn't load today's slate: {e}")
+            return
+        if not slate:
+            await interaction.followup.send("No games on today's slate (or all finished).")
+            return
+
+        legs_found, game_of = await asyncio.to_thread(parlay.streak_candidates, slate, min_streak)
+        if not legs_found:
+            await interaction.followup.send(
+                f"No scanned hitter on today's slate is riding a {min_streak}+ game hit streak."
+            )
+            return
+
+        chosen = parlay.pick_legs(legs_found, game_of, legs)
+        embed = discord.Embed(title=f"🔥 Streak Parlay — {len(chosen)} legs (streaks of {min_streak}+)", color=discord.Color.orange())
+        embed.description = "each leg = hitter to extend their ACTIVE hit streak • ranked by streak length"
+        for i, leg in enumerate(chosen, 1):
+            embed.add_field(
+                name=f"Leg {i}: {leg['batter']} ({leg['team']}) — 🔥 {leg['streak']}-game hit streak",
+                value=_leg_lines(leg, "hit"),
+                inline=False,
+            )
+        embed.set_footer(text="Streaks computed from real game logs • Research, not advice — confirm lineups • Data: Baseball Savant / MLB")
         await interaction.followup.send(embed=embed)
 
     async def _game_autocomplete(self, interaction: discord.Interaction, current: str):
@@ -242,7 +292,7 @@ class ParlayBot(discord.Client):
         return choices
 
     async def _sgp_callback(self, interaction: discord.Interaction, game: str,
-                             legs: Literal[2, 3, 4, 5] = 3):
+                             legs: LegsT = 3):
         await interaction.response.defer()
         try:
             slate = await asyncio.to_thread(parlay.get_today_slate)
@@ -289,7 +339,8 @@ class ParlayBot(discord.Client):
         embed.set_footer(text="SGP legs are correlated — books price them together, so no combined odds shown • Research, not advice")
         await interaction.followup.send(embed=embed)
 
-    async def _moneyline_callback(self, interaction: discord.Interaction, legs: Literal[2, 3, 4, 5] = 3):
+    async def _moneyline_callback(self, interaction: discord.Interaction, legs: LegsT = 3,
+                                   min_odds: int = None, max_odds: int = None):
         await interaction.response.defer()
         try:
             slate = await asyncio.to_thread(parlay.get_today_slate)
@@ -310,8 +361,24 @@ class ParlayBot(discord.Client):
             await interaction.followup.send("No games with both probable starters qualified yet -- try closer to game time.")
             return
 
-        chosen = parlay.pick_one_per_game(evaluated, game_of, legs)
         odds_events = await asyncio.to_thread(odds_api.get_mlb_odds, "h2h")
+        if odds_events and (min_odds is not None or max_odds is not None):
+            filtered = []
+            for leg in evaluated:
+                event = odds_api.find_event(odds_events, leg["pick_team"], leg["opp_team"])
+                bp = odds_api.best_price(odds_api.all_prices(event, "h2h", leg["pick_team"])) if event else None
+                if bp is None:
+                    continue
+                if min_odds is not None and bp[1] < min_odds:
+                    continue
+                if max_odds is not None and bp[1] > max_odds:
+                    continue
+                filtered.append(leg)
+            evaluated = filtered
+            if not evaluated:
+                await interaction.followup.send("No moneyline legs fit that odds range today.")
+                return
+        chosen = parlay.pick_legs(evaluated, game_of, legs, max_per_game=1)
 
         best_leg_prices = []
         embed = discord.Embed(title=f"💰 Moneyline Parlay — {len(chosen)} legs", color=discord.Color.green())
@@ -348,7 +415,7 @@ class ParlayBot(discord.Client):
 
     async def _totals_callback(self, interaction: discord.Interaction,
                                 lean: Literal["overs", "unders"] = "overs",
-                                legs: Literal[2, 3, 4, 5] = 3):
+                                legs: LegsT = 3):
         await interaction.response.defer()
         try:
             slate = await asyncio.to_thread(parlay.get_today_slate)
