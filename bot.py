@@ -229,8 +229,6 @@ class ParlayBot(discord.Client):
             value = _leg_lines(leg, market)
             priced = leg.get("_priced") or await asyncio.to_thread(_price_leg, leg)
             if priced:
-                label = "to record a hit" if market == "hit" else ("to homer" if market == "hr" else f"over {priced['point']}")
-                value += f"\nOdds ({label}): " + odds_api.format_prices(priced["prices"])
                 bp = odds_api.best_price(priced["prices"])
                 if bp:
                     best_leg_prices.append(bp[1])
@@ -238,6 +236,9 @@ class ParlayBot(discord.Client):
                     link = (priced.get("links") or {}).get(bp[0])
                     if link:
                         bet_buttons.append((f"Leg {i}: {leg['batter'].split()[-1]} {bp[1]:+d} @ {bp[0]}", link))
+                    else:
+                        label = "to record a hit" if market == "hit" else ("to homer" if market == "hr" else f"over {priced['point']}")
+                        value += f"\nOdds ({label}): " + odds_api.format_prices(priced["prices"])
             embed.add_field(
                 name=f"Leg {i}: {leg['batter']} ({leg['team']})",
                 value=value,
@@ -306,11 +307,12 @@ class ParlayBot(discord.Client):
                     props = await asyncio.to_thread(odds_api.get_event_props, ev.get("id"), "pitcher_strikeouts")
                     priced = odds_api.player_prop_prices(props, "pitcher_strikeouts", leg["starter"]) if props else None
                     if priced:
-                        value += f"\nK line {priced['point']} — over: " + odds_api.format_prices(priced["prices"])
                         bp = odds_api.best_price(priced["prices"])
                         link = (priced.get("links") or {}).get(bp[0]) if bp else None
                         if bp and link:
-                            bet_buttons.append((f"Leg {i}: {leg['starter'].split()[-1]} O{priced['point']} @ {bp[0]}", link))
+                            bet_buttons.append((f"Leg {i}: {leg['starter'].split()[-1]} O{priced['point']} {bp[1]:+d} @ {bp[0]}", link))
+                        else:
+                            value += f"\nK line {priced['point']} — over: " + odds_api.format_prices(priced["prices"])
             embed.add_field(
                 name=f"Leg {i}: {leg['starter']} ({leg['team']}) vs {leg['opponent']}",
                 value=value,
@@ -477,12 +479,13 @@ class ParlayBot(discord.Client):
             if event:
                 prices, links = odds_api.all_prices_and_links(event, "h2h", leg["pick_team"])
                 if prices:
-                    lines.append("Odds: " + odds_api.format_prices(prices))
                     bp = odds_api.best_price(prices)
                     if bp:
                         best_leg_prices.append(bp[1])
                         if links.get(bp[0]):
                             bet_buttons.append((f"Leg {i}: {leg['pick_abbrev']} ML {bp[1]:+d} @ {bp[0]}", links[bp[0]]))
+                        else:
+                            lines.append("Odds: " + odds_api.format_prices(prices))
             embed.add_field(
                 name=f"Leg {i}: {leg['pick_team']} ML over {leg['opp_team']}",
                 value="\n".join(lines),
