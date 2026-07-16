@@ -29,9 +29,17 @@ def et_date_str(offset_days: int = 0) -> str:
     return et.strftime("%Y-%m-%d")
 
 
+_slate_cache: dict = {}
+
+
 def get_today_slate() -> list[dict]:
-    """Today's games with probable starters and team abbreviations."""
+    """Today's games with probable starters and team abbreviations.
+    Cached 10 min so command autocomplete can respond instantly."""
     today = et_date_str(0)
+    import time as _time
+    cached = _slate_cache.get(today)
+    if cached and _time.time() - cached[0] < 600:
+        return cached[1]
     resp = requests.get(
         f"{MLB_BASE}/schedule",
         params={"sportId": 1, "date": today, "hydrate": "probablePitcher,team"},
@@ -55,6 +63,7 @@ def get_today_slate() -> list[dict]:
                     "starter_name": probable.get("fullName"),
                 }
             slate.append(entry)
+    _slate_cache[today] = (__import__("time").time(), slate)
     return slate
 
 
@@ -362,3 +371,32 @@ def evaluate_total_leg(game: dict) -> dict | None:
         "combined_runs_pg": round(combined, 2),
         "rank_metric": round(combined, 2),
     }
+
+
+def sgp_candidates(game: dict) -> dict:
+    """Same-game parlay building blocks from ONE game: the better starter's
+    K leg, plus hit candidates from both lineups vs the opposing starter.
+    Structure is fixed (no cross-metric composite ranking): K leg chosen by
+    K%, hit legs ranked by xBA vs the starter's hand."""
+    k_legs = []
+    hit_legs = []
+    for side, opp_side in (("home", "away"), ("away", "home")):
+        team = game["teams"][side]
+        opp = game["teams"][opp_side]
+        if team["starter_id"]:
+            k = evaluate_k_leg(team["starter_id"], team["starter_name"], team["abbrev"], opp["abbrev"])
+            if k:
+                k_legs.append(k)
+        if opp["starter_id"]:
+            try:
+                hand = get_starter_hand(opp["starter_id"])
+            except Exception:
+                hand = None
+            if hand in ("L", "R"):
+                for batter in shortlist_hitters([team["abbrev"]], "xba", 3):
+                    leg = evaluate_hit_leg(batter, opp["starter_id"], opp["starter_name"], hand, "hit")
+                    if leg:
+                        hit_legs.append(leg)
+    k_legs.sort(key=lambda x: -(x.get("rank_metric") or 0))
+    hit_legs.sort(key=lambda x: -(x.get("rank_metric") or 0))
+    return {"k_legs": k_legs, "hit_legs": hit_legs}
