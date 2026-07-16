@@ -156,3 +156,98 @@ def format_prices(prices: dict, limit: int = 4) -> str:
             tag += " ← best"
         parts.append(tag)
     return " • ".join(parts)
+
+
+# ---------- player props (paid tier) ----------
+
+EVENTS_BASE = "https://api.the-odds-api.com/v4/sports/baseball_mlb/events"
+
+# Market keys per our parlay types; hits/HR props are Over 0.5 lines
+PROP_MARKETS = {"hit": "batter_hits", "hr": "batter_home_runs", "k": "pitcher_strikeouts"}
+
+_event_cache: dict = {}
+
+
+def get_events() -> list[dict]:
+    """Today's event list (ids + team names). Cached like odds."""
+    if not API_KEY:
+        return []
+    now = time.time()
+    cached = _cache.get("__events__")
+    if cached and now - cached[0] < CACHE_SECONDS:
+        return cached[1]
+    try:
+        resp = requests.get(EVENTS_BASE, params={"apiKey": API_KEY}, timeout=20)
+        if resp.status_code != 200:
+            log.warning("Odds events %s: %s", resp.status_code, resp.text[:200])
+            _cache["__events__"] = (now, [])
+            return []
+        data = resp.json()
+        _cache["__events__"] = (now, data)
+        return data
+    except Exception as e:
+        log.warning("Odds events fetch failed: %s", e)
+        return []
+
+
+def get_event_props(event_id: str, market_key: str) -> dict | None:
+    """One event's prop odds for one market, cached 30 min. None if the
+    plan/books don't carry it -- callers degrade gracefully."""
+    if not API_KEY or not event_id:
+        return None
+    now = time.time()
+    key = (event_id, market_key)
+    cached = _event_cache.get(key)
+    if cached and now - cached[0] < CACHE_SECONDS:
+        return cached[1]
+    try:
+        resp = requests.get(
+            f"{EVENTS_BASE}/{event_id}/odds",
+            params={"apiKey": API_KEY, "regions": "us", "markets": market_key, "oddsFormat": "american"},
+            timeout=20,
+        )
+        if resp.status_code != 200:
+            log.warning("Odds props %s (%s): %s", resp.status_code, market_key, resp.text[:200])
+            _event_cache[key] = (now, None)
+            return None
+        data = resp.json()
+        _event_cache[key] = (now, data)
+        remaining = resp.headers.get("x-requests-remaining")
+        if remaining is not None:
+            log.info("Odds props ok (%s), requests remaining: %s", market_key, remaining)
+        return data
+    except Exception as e:
+        log.warning("Odds props fetch failed: %s", e)
+        return None
+
+
+def player_prop_prices(event_data: dict, market_key: str, player_name: str) -> dict | None:
+    """{book: price} for a player's OVER, plus the line. For hits/HR that's
+    'Over 0.5' = to record one; for Ks it's the posted strikeout line.
+    Returns {'point': x, 'prices': {book: price}} or None if unpriced."""
+    if not event_data:
+        return None
+    target = _fold(player_name)
+    target_last = target.split()[-1] if target else ""
+    by_point: dict = {}
+    for book in event_data.get("bookmakers", []) or []:
+        for market in book.get("markets", []) or []:
+            if market.get("key") != market_key:
+                continue
+            for outcome in market.get("outcomes", []) or []:
+                if (outcome.get("name") or "").lower() != "over":
+                    continue
+                desc = _fold(outcome.get("description"))
+                if not desc or (target not in desc and target_last not in desc):
+                    continue
+                pt = outcome.get("point")
+                bucket = by_point.setdefault(pt, {})
+                bucket[book.get("title", "?")] = outcome.get("price")
+    if not by_point:
+        return None
+    # Hits/HR: want the 0.5 line when present; otherwise most-quoted point
+    if market_key in ("batter_hits", "batter_home_runs") and 0.5 in by_point:
+        point = 0.5
+    else:
+        point = max(by_point, key=lambda p: len(by_point[p]))
+    return {"point": point, "prices": by_point[point]}
