@@ -96,15 +96,18 @@ def find_event(events: list[dict], team_a: str, team_b: str) -> dict | None:
     return None
 
 
-def all_prices_and_links(event: dict, market_key: str, outcome_name: str) -> tuple[dict, dict]:
-    """({book: price}, {book: deepest available link}) for one outcome."""
-    prices, links = {}, {}
+def all_prices_and_links(event: dict, market_key: str, outcome_name: str, point=None) -> tuple[dict, dict, dict]:
+    """({book: price}, {book: link}, {book: sids}) for one outcome. If
+    `point` is given (totals), only outcomes at that point qualify."""
+    prices, links, sids = {}, {}, {}
     target = _fold(outcome_name)
     for book in event.get("bookmakers", []) or []:
         for market in book.get("markets", []) or []:
             if market.get("key") != market_key:
                 continue
             for outcome in market.get("outcomes", []) or []:
+                if point is not None and outcome.get("point") != point:
+                    continue
                 name = _fold(outcome.get("name"))
                 if name and (name in target or target in name):
                     title = book.get("title", "?")
@@ -112,7 +115,8 @@ def all_prices_and_links(event: dict, market_key: str, outcome_name: str) -> tup
                     link = _clean_link(outcome.get("link") or market.get("link") or book.get("link"))
                     if link:
                         links[title] = link
-    return prices, links
+                    sids[title] = {"market": market.get("sid"), "outcome": outcome.get("sid")}
+    return prices, links, sids
 
 
 def all_prices(event: dict, market_key: str, outcome_name: str) -> dict:
