@@ -51,7 +51,14 @@ SPORT_KEY = "baseball_mlb"
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 MLB_BASE = "https://statsapi.mlb.com/api/v1"
 
-BOOKMAKERS = ["fanduel", "draftkings", "betmgm", "williamhill_us"]  # williamhill_us = Caesars
+# Sharp 4 (consensus anchors) + soft US books (EV targets). Up to 10
+# bookmakers bill as ONE unit at The Odds API, so widening costs nothing.
+BOOKMAKERS = ["fanduel", "draftkings", "betmgm", "williamhill_us",
+              "betrivers", "espnbet", "fanatics", "hardrockbet", "ballybet"]
+# Fair value comes ONLY from these (by API response title). Soft books get
+# EV-checked against the sharp consensus but never pollute it -- a stale
+# BetRivers line can be a betting target, never a fair-value input.
+SHARP_BOOK_TITLES = {"FanDuel", "DraftKings", "BetMGM", "Caesars"}
 
 MARKETS = [
     {"key": "batter_hits", "label": "Hits"},
@@ -73,7 +80,7 @@ GAME_MARKET_KEYS = {"h2h", "spreads", "totals"}
 # Scheduled picks only post plays clearing this bar; below it = "no bet".
 EV_MIN_PCT = float(os.getenv("EV_MIN_PCT", "5.0"))
 # Strong-edge alert: any play at/above this EV posts immediately when found.
-EV_ALERT_MIN_PCT = float(os.getenv("EV_ALERT_MIN_PCT", "15.0"))
+EV_ALERT_MIN_PCT = float(os.getenv("EV_ALERT_MIN_PCT", "5.0"))
 # Dedicated alert scan cadence. Cost-aware default: each scan ~9 credits x
 # ~15 events ~ 135 credits; every 120 min ~ 12 scans/day ~ 1.6K credits/day
 # (~49K/month) on top of the two pick scans -- fits a 100K/month plan with
@@ -416,6 +423,8 @@ def _compute_ev_rows(groups: list[dict]) -> list[dict]:
         s1, s2 = side_names
 
         for book_name, prices in books.items():
+            if book_name not in SHARP_BOOK_TITLES:
+                continue  # soft books are EV targets, never consensus inputs
             if s1 not in prices or s2 not in prices:
                 continue
             i1, i2 = _implied_prob(prices[s1]), _implied_prob(prices[s2])
@@ -865,7 +874,7 @@ def register_commands(tree: app_commands.CommandTree):
             for i, r in enumerate(rows[:5])
         ]
         embed = discord.Embed(title="🔝 Top 5 EV Plays Right Now", description="\n".join(lines), color=discord.Color.purple())
-        embed.set_footer(text="Consensus no-vig fair price across FD/DK/MGM/Caesars.")
+        embed.set_footer(text="Sharp-book consensus (FD/DK/MGM/Caesars) • soft books scanned as targets.")
         await msg.edit(content=None, embed=embed)
 
     async def _evcheck(interaction: discord.Interaction, player_name: str):
@@ -893,7 +902,7 @@ def register_commands(tree: app_commands.CommandTree):
             for r in matches[:10]
         ]
         embed = discord.Embed(title=f"{matches[0]['player']} — Current Prop EV", description="\n".join(lines), color=discord.Color.blue())
-        embed.set_footer(text="Consensus no-vig fair price across FD/DK/MGM/Caesars.")
+        embed.set_footer(text="Sharp-book consensus (FD/DK/MGM/Caesars) • soft books scanned as targets.")
         await msg.edit(content=None, embed=embed)
 
     async def _evrecord(interaction: discord.Interaction):
