@@ -63,7 +63,21 @@ MARKETS = [
 ]
 MARKET_LABEL = {m["key"]: m["label"] for m in MARKETS}
 
-NIGHTLY_PICK_HOUR_UTC = int(os.getenv("NIGHTLY_PICK_HOUR_UTC", "21"))   # 5pm ET (EDT)
+def _parse_pick_times() -> list[dtime]:
+    """EV_PICK_TIMES_UTC: comma-separated HH:MM UTC times. Default
+    15:30,21:00 = 11:30 AM + 5:00 PM ET during EDT (UTC-4)."""
+    raw = os.getenv("EV_PICK_TIMES_UTC", "15:30,21:00")
+    times = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        hh, _, mm = part.partition(":")
+        times.append(dtime(hour=int(hh), minute=int(mm or 0)))
+    return times or [dtime(hour=21, minute=0)]
+
+
+EV_PICK_TIMES = _parse_pick_times()
 NIGHTLY_RECAP_HOUR_UTC = int(os.getenv("NIGHTLY_RECAP_HOUR_UTC", "5"))  # 1am ET (EDT)
 
 
@@ -173,6 +187,18 @@ def _save_pick(pick_date: str, row: dict, message_id: str = None) -> int:
              row["ev_pct"], message_id),
         )
         return cur.lastrowid
+
+
+def _get_todays_picked_keys(pick_date: str) -> set:
+    """(player, market, point, side) combos already picked today -- the
+    second daily post skips these so one bet never books twice in the
+    ledger; it takes the best REMAINING edge instead."""
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT player, market_key, point, side FROM ev_picks WHERE pick_date = ?",
+            (pick_date,),
+        ).fetchall()
+    return {(r["player"], r["market_key"], r["point"], r["side"]) for r in rows}
 
 
 def _get_pending_picks(before_date: str = None) -> list[dict]:
@@ -436,6 +462,12 @@ async def _post_nightly_pick() -> str:
         await channel.send("No props available across tonight's slate to pick from.")
         return "No rows found."
 
+    already = _get_todays_picked_keys(_et_date_str(0))
+    rows = [r for r in rows if (r["player"], r["market_key"], r["point"], r["side"]) not in already]
+    if not rows:
+        await channel.send("Every remaining edge today was already picked earlier -- no second play.")
+        return "All top plays already picked today."
+
     best = rows[0]
     try:
         message = await channel.send(embed=_build_pick_embed(best))
@@ -513,7 +545,7 @@ async def _grade_pending():
             log.error("Failed to post EV recap: %s", e)
 
 
-@tasks.loop(time=dtime(hour=NIGHTLY_PICK_HOUR_UTC, minute=0))
+@tasks.loop(time=EV_PICK_TIMES)
 async def _nightly_pick_task():
     try:
         await _post_nightly_pick()
@@ -654,5 +686,5 @@ def start_tasks(client: discord.Client):
         _nightly_pick_task.start()
     if not _nightly_recap_task.is_running():
         _nightly_recap_task.start()
-    log.info("EV features active: nightly pick %02d:00 UTC, recap %02d:00 UTC, DB at %s",
-             NIGHTLY_PICK_HOUR_UTC, NIGHTLY_RECAP_HOUR_UTC, EV_DB_PATH)
+    log.info("EV features active: picks at %s UTC, recap %02d:00 UTC, DB at %s",
+             ", ".join(t.strftime("%H:%M") for t in EV_PICK_TIMES), NIGHTLY_RECAP_HOUR_UTC, EV_DB_PATH)
