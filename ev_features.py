@@ -845,10 +845,6 @@ def register_commands(tree: app_commands.CommandTree):
     """Call once, anywhere before your existing tree.sync()."""
     _init_db()
 
-    async def _setevchannel(interaction: discord.Interaction):
-        _set_config("ev_channel_id", str(interaction.channel_id))
-        await interaction.response.send_message(f"✅ Nightly EV pick + recap will post in {interaction.channel.mention}.")
-
     async def _topev(interaction: discord.Interaction):
         await interaction.response.defer()
         msg = await interaction.followup.send("Scanning tonight's slate across 6 markets, 4 books...")
@@ -905,58 +901,18 @@ def register_commands(tree: app_commands.CommandTree):
         embed.set_footer(text="Sharp-book consensus (FD/DK/MGM/Caesars) • soft books scanned as targets.")
         await msg.edit(content=None, embed=embed)
 
-    async def _evrecord(interaction: discord.Interaction):
-        await interaction.response.defer()
-        record = _get_season_record()
-        graded = record["wins"] + record["losses"] + record["pushes"]
-        if graded == 0:
-            await interaction.followup.send("No graded EV picks yet -- check back after tonight's recap.")
-            return
-        embed = discord.Embed(
-            title="📊 Nightly EV Pick — Season Record",
-            description=(
-                f"**{record['wins']}-{record['losses']}-{record['pushes']}** ({graded} picks graded)\n"
-                f"Net units: **{record['net_units']:+.2f}U** (1U per pick)"
-            ),
-            color=discord.Color.green() if record["net_units"] >= 0 else discord.Color.red(),
-        )
-        await interaction.followup.send(embed=embed)
-
-    async def _postevpick(interaction: discord.Interaction):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("Admin only.", ephemeral=True)
-            return
-        await interaction.response.defer()
-        result = await _post_nightly_pick()
-        await interaction.followup.send(result)
-
-    tree.add_command(app_commands.Command(
-        name="setevchannel", description="Set this channel for the nightly EV pick + recap",
-        callback=_setevchannel))
     tree.add_command(app_commands.Command(
         name="topev", description="Show the top 5 highest-EV plays right now, live",
         callback=_topev))
     tree.add_command(app_commands.Command(
         name="evcheck", description="Check current EV on a specific player's props",
         callback=_evcheck))
-    tree.add_command(app_commands.Command(
-        name="evrecord", description="Season unit record for the nightly EV picks",
-        callback=_evrecord))
-    tree.add_command(app_commands.Command(
-        name="postevpick", description="ADMIN: manually trigger tonight's EV pick post now",
-        callback=_postevpick))
 
 
 def start_tasks(client: discord.Client):
-    """Call once from your existing on_ready (safe to call repeatedly)."""
+    """July 23: Mike disabled ALL auto-posting -- no scheduled picks, no
+    alert loop, no recap. EV is on-demand only via /topev and /evcheck.
+    This stays a valid no-op so bot.py's wiring lines don't change."""
     global _client
     _client = client
-    if not _nightly_pick_task.is_running():
-        _nightly_pick_task.start()
-    if not _nightly_recap_task.is_running():
-        _nightly_recap_task.start()
-    if not _ev_alert_task.is_running():
-        _ev_alert_task.start()
-    log.info("EV features active: picks at %s UTC (gate %+g%%), alerts %g%%+ every %dmin, recap %02d:00 UTC, DB at %s",
-             ", ".join(t.strftime("%H:%M") for t in EV_PICK_TIMES), EV_MIN_PCT,
-             EV_ALERT_MIN_PCT, EV_ALERT_POLL_MINUTES, NIGHTLY_RECAP_HOUR_UTC, EV_DB_PATH)
+    log.info("EV features: ON-DEMAND ONLY (auto-posts disabled) -- /topev and /evcheck active")
