@@ -60,8 +60,25 @@ MARKETS = [
     {"key": "pitcher_strikeouts", "label": "Strikeouts"},
     {"key": "pitcher_hits_allowed", "label": "Hits Allowed"},
     {"key": "pitcher_outs", "label": "Outs"},
+    # Game-level markets (July 23): any MLB play qualifies, not just props.
+    {"key": "h2h", "label": "Moneyline"},
+    {"key": "spreads", "label": "Run Line"},
+    {"key": "totals", "label": "Game Total"},
 ]
 MARKET_LABEL = {m["key"]: m["label"] for m in MARKETS}
+PROP_MARKET_KEYS = {"batter_hits", "batter_total_bases", "batter_hits_runs_rbis",
+                     "pitcher_strikeouts", "pitcher_hits_allowed", "pitcher_outs"}
+GAME_MARKET_KEYS = {"h2h", "spreads", "totals"}
+
+# Scheduled picks only post plays clearing this bar; below it = "no bet".
+EV_MIN_PCT = float(os.getenv("EV_MIN_PCT", "5.0"))
+# Strong-edge alert: any play at/above this EV posts immediately when found.
+EV_ALERT_MIN_PCT = float(os.getenv("EV_ALERT_MIN_PCT", "15.0"))
+# Dedicated alert scan cadence. Cost-aware default: each scan ~9 credits x
+# ~15 events ~ 135 credits; every 120 min ~ 12 scans/day ~ 1.6K credits/day
+# (~49K/month) on top of the two pick scans -- fits a 100K/month plan with
+# room for the site's other usage. Tighten at your own credit budget.
+EV_ALERT_POLL_MINUTES = int(os.getenv("EV_ALERT_POLL_MINUTES", "120"))
 
 def _parse_pick_times() -> list[dtime]:
     """EV_PICK_TIMES_UTC: comma-separated HH:MM UTC times. Default
@@ -79,6 +96,18 @@ def _parse_pick_times() -> list[dtime]:
 
 EV_PICK_TIMES = _parse_pick_times()
 NIGHTLY_RECAP_HOUR_UTC = int(os.getenv("NIGHTLY_RECAP_HOUR_UTC", "5"))  # 1am ET (EDT)
+
+
+def _play_desc(r: dict) -> str:
+    """Human bet string per market type: 'Over 1.5' (props), 'Over 8.5'
+    (total), 'Yankees -1.5' (run line -- side already carries the number),
+    'Yankees ML' (moneyline)."""
+    mk = r["market_key"]
+    if mk == "h2h":
+        return f"{r['side']} ML"
+    if mk == "spreads":
+        return r["side"]
+    return f"{r['side']} {r['point']}"
 
 
 def _api_key() -> str | None:
@@ -157,6 +186,17 @@ def _init_db():
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS ev_alerts (
+                alert_date TEXT,
+                market_key TEXT,
+                player TEXT,
+                point REAL,
+                side TEXT,
+                book TEXT,
+                PRIMARY KEY (alert_date, market_key, player, point, side, book)
+            )
+        """)
 
 
 def _set_config(key: str, value: str):
@@ -187,6 +227,25 @@ def _save_pick(pick_date: str, row: dict, message_id: str = None) -> int:
              row["ev_pct"], message_id),
         )
         return cur.lastrowid
+
+
+def _alert_already_sent(alert_date, market_key, player, point, side, book) -> bool:
+    with _conn() as c:
+        row = c.execute(
+            "SELECT 1 FROM ev_alerts WHERE alert_date=? AND market_key=? AND player=? "
+            "AND point IS ? AND side=? AND book=?",
+            (alert_date, market_key, player, point, side, book),
+        ).fetchone()
+        return row is not None
+
+
+def _mark_alert_sent(alert_date, market_key, player, point, side, book):
+    with _conn() as c:
+        c.execute(
+            "INSERT OR IGNORE INTO ev_alerts (alert_date, market_key, player, point, side, book) "
+            "VALUES (?,?,?,?,?,?)",
+            (alert_date, market_key, player, point, side, book),
+        )
 
 
 def _get_todays_picked_keys(pick_date: str) -> set:
@@ -275,54 +334,105 @@ def _fetch_event_odds(api_key: str, event_id: str) -> dict:
 
 
 def _extract_priced_lines(event_data: dict, matchup: str) -> list[dict]:
+    """Groups every two-sided line so no-vig consensus can be computed:
+    - props: keyed (market, player, point), sides Over/Under
+    - totals: keyed (market, point), sides Over/Under
+    - spreads: keyed (market, |point|), sides like 'Yankees -1.5' (label
+      carries the signed number so it stays consistent across books)
+    - h2h: keyed (market,), sides = the two team names"""
     groups: dict[tuple, dict] = {}
     for book in event_data.get("bookmakers", []):
         for market in book.get("markets", []):
-            label = MARKET_LABEL.get(market["key"])
+            mk = market["key"]
+            label = MARKET_LABEL.get(mk)
             if not label:
                 continue
             for outcome in market.get("outcomes", []):
-                player = outcome.get("description", "Unknown")
-                point = outcome.get("point")
-                if point is None:
+                price = outcome.get("price")
+                name = outcome.get("name")
+                if price is None or not name:
                     continue
-                key = (market["key"], player, point)
+                point = outcome.get("point")
+
+                if mk in PROP_MARKET_KEYS:
+                    player = outcome.get("description", "Unknown")
+                    if point is None:
+                        continue
+                    key = (mk, player, point)
+                    side = name
+                    row_point = point
+                elif mk == "totals":
+                    if point is None:
+                        continue
+                    key = (mk, "", point)
+                    side = name  # Over/Under
+                    row_point = point
+                    player = ""
+                elif mk == "spreads":
+                    if point is None:
+                        continue
+                    key = (mk, "", abs(point))
+                    side = f"{name} {point:+g}"
+                    row_point = point
+                    player = ""
+                else:  # h2h
+                    key = (mk, "", None)
+                    side = name  # team name
+                    row_point = None
+                    player = ""
+
                 if key not in groups:
                     groups[key] = {
-                        "market_key": market["key"], "market_label": label,
-                        "player": player, "point": point, "matchup": matchup,
-                        "books": {},
+                        "market_key": mk, "market_label": label,
+                        "player": player, "matchup": matchup, "books": {},
+                        "side_points": {},
                     }
-                groups[key]["books"].setdefault(book["title"], {})[outcome["name"]] = outcome["price"]
+                groups[key]["books"].setdefault(book["title"], {})[side] = price
+                groups[key]["side_points"][side] = row_point
     return list(groups.values())
 
 
 def _compute_ev_rows(groups: list[dict]) -> list[dict]:
+    """Per-book no-vig fair from any book carrying BOTH sides of the same
+    line (Over/Under, both teams, both run-line sides); consensus = average
+    across those books; EV per individual book price vs consensus."""
     rows = []
     for g in groups:
         books = g["books"]
-        per_book_fair_over = {}
-        for book_name, prices in books.items():
-            if "Over" not in prices or "Under" not in prices:
-                continue
-            io, iu = _implied_prob(prices["Over"]), _implied_prob(prices["Under"])
-            total = io + iu
-            if total <= 0:
-                continue
-            per_book_fair_over[book_name] = io / total
-        if not per_book_fair_over:
-            continue
-        fair_over = sum(per_book_fair_over.values()) / len(per_book_fair_over)
-        fair_under = 1 - fair_over
+        per_book_fair: dict[str, dict[str, float]] = {}
+        side_names = set()
+        for prices in books.values():
+            side_names.update(prices.keys())
+        side_names = sorted(side_names)
+        if len(side_names) != 2:
+            continue  # need exactly a two-sided market to de-vig
+        s1, s2 = side_names
 
         for book_name, prices in books.items():
-            for side, fair_prob in (("Over", fair_over), ("Under", fair_under)):
-                if side not in prices:
+            if s1 not in prices or s2 not in prices:
+                continue
+            i1, i2 = _implied_prob(prices[s1]), _implied_prob(prices[s2])
+            total = i1 + i2
+            if total <= 0:
+                continue
+            per_book_fair[book_name] = {s1: i1 / total, s2: i2 / total}
+
+        if not per_book_fair:
+            continue
+        consensus = {
+            s: sum(f[s] for f in per_book_fair.values()) / len(per_book_fair)
+            for s in (s1, s2)
+        }
+
+        for book_name, prices in books.items():
+            for side, price in prices.items():
+                fair_prob = consensus.get(side)
+                if fair_prob is None:
                     continue
-                price = prices[side]
                 rows.append({
                     "market_key": g["market_key"], "market_label": g["market_label"],
-                    "matchup": g["matchup"], "player": g["player"], "point": g["point"],
+                    "matchup": g["matchup"], "player": g["player"],
+                    "point": g["side_points"].get(side),
                     "side": side, "book": book_name, "price": price,
                     "fair_prob_pct": round(fair_prob * 100, 2),
                     "ev_pct": round(_ev_percent(fair_prob, price), 2),
@@ -388,10 +498,47 @@ def _get_mlb_games(date_str: str) -> list[dict]:
         for g in date_entry.get("games", []):
             games.append({
                 "game_pk": g["gamePk"],
+                "status": (g.get("status") or {}).get("abstractGameState"),
                 "home_team": g["teams"]["home"]["team"]["name"],
                 "away_team": g["teams"]["away"]["team"]["name"],
+                "home_score": (g["teams"]["home"] or {}).get("score"),
+                "away_score": (g["teams"]["away"] or {}).get("score"),
             })
     return games
+
+
+def _grade_game_market(pick: dict, game: dict):
+    """Grades h2h/spreads/totals from the final score. Returns
+    (result, actual_value) or None if it can't be determined."""
+    hs, as_ = game.get("home_score"), game.get("away_score")
+    if hs is None or as_ is None:
+        return None
+    home, away = game["home_team"], game["away_team"]
+    mk, side = pick["market_key"], pick["side"]
+
+    if mk == "totals":
+        total = hs + as_
+        return _grade(pick["point"], side, total), float(total)
+
+    if mk == "h2h":
+        picked = side
+        if picked not in (home, away):
+            return None
+        margin = (hs - as_) if picked == home else (as_ - hs)
+        return ("win" if margin > 0 else "loss"), float(margin)
+
+    if mk == "spreads":
+        picked = side.rsplit(" ", 1)[0]  # 'New York Yankees -1.5' -> team
+        if picked not in (home, away):
+            return None
+        margin = (hs - as_) if picked == home else (as_ - hs)
+        adjusted = margin + (pick["point"] or 0)
+        if adjusted > 0:
+            return "win", float(margin)
+        if adjusted == 0:
+            return "push", float(margin)
+        return "loss", float(margin)
+    return None
 
 
 def _get_boxscore(game_pk: int) -> dict:
@@ -433,10 +580,10 @@ _client: discord.Client | None = None
 
 def _build_pick_embed(row: dict) -> discord.Embed:
     embed = discord.Embed(title="🎯 Tonight's Most +EV Play", color=discord.Color.gold())
-    embed.add_field(name="Player", value=row["player"], inline=True)
+    embed.add_field(name="Player", value=row["player"] or row["matchup"], inline=True)
     embed.add_field(name="Market", value=row["market_label"], inline=True)
     embed.add_field(name="Matchup", value=row["matchup"], inline=False)
-    embed.add_field(name="The Play", value=f"{row['side']} {row['point']} @ {row['book']} ({row['price']:+d})", inline=False)
+    embed.add_field(name="The Play", value=f"{_play_desc(row)} @ {row['book']} ({row['price']:+d})", inline=False)
     embed.add_field(name="Consensus Fair Price", value=f"{row['fair_prob_pct']}% implied", inline=True)
     embed.add_field(name="EV", value=f"{row['ev_pct']:+.2f}%", inline=True)
     embed.add_field(name="Stake", value="1U", inline=True)
@@ -462,11 +609,24 @@ async def _post_nightly_pick() -> str:
         await channel.send("No props available across tonight's slate to pick from.")
         return "No rows found."
 
+    # Strong-edge alerts ride this scan for free before any filtering.
+    try:
+        await _check_and_post_alerts(rows, channel)
+    except Exception as e:
+        log.error("Alert check during pick scan failed: %s", e)
+
     already = _get_todays_picked_keys(_et_date_str(0))
     rows = [r for r in rows if (r["player"], r["market_key"], r["point"], r["side"]) not in already]
+
+    # The honest-tracker gate: no play clearing EV_MIN_PCT means NO BET --
+    # never force a vig-priced ticket into the ledger just to post something.
+    rows = [r for r in rows if r["ev_pct"] >= EV_MIN_PCT]
     if not rows:
-        await channel.send("Every remaining edge today was already picked earlier -- no second play.")
-        return "All top plays already picked today."
+        await channel.send(
+            f"📭 No play clears the **+{EV_MIN_PCT:g}% EV** bar this scan — no bet. "
+            f"The ledger only takes real edges."
+        )
+        return "No play cleared the EV threshold."
 
     best = rows[0]
     try:
@@ -500,26 +660,35 @@ async def _grade_pending():
                 games_cache[pick["pick_date"]] = []
 
         away, home = pick["matchup"].split(" @ ")
-        game_pk = next(
-            (g["game_pk"] for g in games_cache[pick["pick_date"]]
+        game = next(
+            (g for g in games_cache[pick["pick_date"]]
              if g["away_team"] == away and g["home_team"] == home),
             None,
         )
-        if game_pk is None:
+        if game is None:
             log.warning("Couldn't match game for pick %s (%s) -- leaving pending", pick["id"], pick["matchup"])
             continue
-
-        try:
-            boxscore = await asyncio.to_thread(_get_boxscore, game_pk)
-            actual = _find_player_stat(boxscore, pick["player"], pick["market_key"])
-        except Exception as e:
-            log.error("Grading fetch failed for pick %s: %s", pick["id"], e)
-            continue
-        if actual is None:
-            log.warning("No stat for %s (%s) in game %s -- leaving pending", pick["player"], pick["market_key"], game_pk)
+        if game.get("status") != "Final":
+            log.info("Game not Final yet for pick %s (%s) -- leaving pending", pick["id"], pick["matchup"])
             continue
 
-        result = _grade(pick["point"], pick["side"], actual)
+        if pick["market_key"] in GAME_MARKET_KEYS:
+            graded_game = _grade_game_market(pick, game)
+            if graded_game is None:
+                log.warning("Couldn't grade game-market pick %s -- leaving pending", pick["id"])
+                continue
+            result, actual = graded_game
+        else:
+            try:
+                boxscore = await asyncio.to_thread(_get_boxscore, game["game_pk"])
+                actual = _find_player_stat(boxscore, pick["player"], pick["market_key"])
+            except Exception as e:
+                log.error("Grading fetch failed for pick %s: %s", pick["id"], e)
+                continue
+            if actual is None:
+                log.warning("No stat for %s (%s) in game %s -- leaving pending", pick["player"], pick["market_key"], game["game_pk"])
+                continue
+            result = _grade(pick["point"], pick["side"], actual)
         profit = _profit_per_unit(pick["price"]) if result == "win" else (-1.0 if result == "loss" else 0.0)
         _grade_pick_row(pick["id"], result, actual, profit)
         graded.append((pick, result, actual, profit))
@@ -530,8 +699,8 @@ async def _grade_pending():
         for pick, result, actual, profit in graded:
             emoji = {"win": "✅", "loss": "❌", "push": "➖"}[result]
             lines.append(
-                f"{emoji} **{pick['player']}** {pick['side']} {pick['point']} {pick['market_label']} "
-                f"(actual: {actual}) — {profit:+.2f}U"
+                f"{emoji} **{pick['player'] or pick['matchup']}** {_play_desc(pick)} {pick['market_label']} "
+                f"(actual: {actual:g}) — {profit:+.2f}U"
             )
         record = _get_season_record()
         embed = discord.Embed(
@@ -543,6 +712,62 @@ async def _grade_pending():
             await channel.send(embed=embed)
         except Exception as e:
             log.error("Failed to post EV recap: %s", e)
+
+
+async def _check_and_post_alerts(rows: list[dict], channel):
+    """Posts a 🚨 alert for every play at/above EV_ALERT_MIN_PCT not yet
+    alerted today. Any MLB market qualifies. Deduped per (day, line, book)."""
+    if channel is None:
+        return
+    today = _et_date_str(0)
+    for r in rows:
+        if r["ev_pct"] < EV_ALERT_MIN_PCT:
+            break  # rows are sorted best-first
+        if _alert_already_sent(today, r["market_key"], r["player"], r["point"], r["side"], r["book"]):
+            continue
+        embed = discord.Embed(
+            title=f"🚨 {r['ev_pct']:+.1f}% EV ALERT",
+            color=discord.Color.red(),
+        )
+        embed.add_field(name="Play", value=f"{_play_desc(r)} — {r['player'] or r['matchup']}", inline=False)
+        embed.add_field(name="Market", value=r["market_label"], inline=True)
+        embed.add_field(name="Book", value=f"{r['book']} ({r['price']:+d})", inline=True)
+        embed.add_field(name="Consensus Fair", value=f"{r['fair_prob_pct']}%", inline=True)
+        embed.set_footer(text=f"Edges this large are rare and often mean a stale or just-suspended line — verify it's still live before betting. Alert bar: {EV_ALERT_MIN_PCT:g}%+")
+        try:
+            await channel.send(embed=embed)
+            _mark_alert_sent(today, r["market_key"], r["player"], r["point"], r["side"], r["book"])
+            log.info("EV alert posted: %s %s at %s (%.2f%%)", r["player"] or r["matchup"], _play_desc(r), r["book"], r["ev_pct"])
+        except Exception as e:
+            log.error("Failed to post EV alert: %s", e)
+
+
+async def _run_alert_scan():
+    channel_id = _get_config("ev_channel_id")
+    if not channel_id:
+        return
+    channel = _client.get_channel(int(channel_id))
+    if channel is None:
+        return
+    try:
+        rows = await _scan_all_ev()
+    except Exception as e:
+        log.error("Alert scan failed: %s", e)
+        return
+    await _check_and_post_alerts(rows, channel)
+
+
+@tasks.loop(minutes=EV_ALERT_POLL_MINUTES)
+async def _ev_alert_task():
+    try:
+        await _run_alert_scan()
+    except Exception as e:
+        log.error("EV alert task failed, will retry next cycle: %s", e)
+
+
+@_ev_alert_task.before_loop
+async def _before_alerts():
+    await _client.wait_until_ready()
 
 
 @tasks.loop(time=EV_PICK_TIMES)
@@ -601,7 +826,7 @@ def register_commands(tree: app_commands.CommandTree):
             await msg.edit(content="No props found for today's slate yet -- try closer to game time.")
             return
         lines = [
-            f"**{i+1}. {r['player']}** ({r['market_label']}) — {r['side']} {r['point']} @ {r['book']} "
+            f"**{i+1}. {r['player'] or r['matchup']}** ({r['market_label']}) — {_play_desc(r)} @ {r['book']} "
             f"({r['price']:+d}) — EV **{r['ev_pct']:+.2f}%**"
             for i, r in enumerate(rows[:5])
         ]
@@ -629,7 +854,7 @@ def register_commands(tree: app_commands.CommandTree):
             await msg.edit(content=f"No current props found for '{player_name}'.")
             return
         lines = [
-            f"**{r['market_label']}**: {r['side']} {r['point']} @ {r['book']} ({r['price']:+d}) — EV **{r['ev_pct']:+.2f}%**"
+            f"**{r['market_label']}**: {_play_desc(r)} @ {r['book']} ({r['price']:+d}) — EV **{r['ev_pct']:+.2f}%**"
             for r in matches[:10]
         ]
         embed = discord.Embed(title=f"{matches[0]['player']} — Current Prop EV", description="\n".join(lines), color=discord.Color.blue())
@@ -686,5 +911,8 @@ def start_tasks(client: discord.Client):
         _nightly_pick_task.start()
     if not _nightly_recap_task.is_running():
         _nightly_recap_task.start()
-    log.info("EV features active: picks at %s UTC, recap %02d:00 UTC, DB at %s",
-             ", ".join(t.strftime("%H:%M") for t in EV_PICK_TIMES), NIGHTLY_RECAP_HOUR_UTC, EV_DB_PATH)
+    if not _ev_alert_task.is_running():
+        _ev_alert_task.start()
+    log.info("EV features active: picks at %s UTC (gate %+g%%), alerts %g%%+ every %dmin, recap %02d:00 UTC, DB at %s",
+             ", ".join(t.strftime("%H:%M") for t in EV_PICK_TIMES), EV_MIN_PCT,
+             EV_ALERT_MIN_PCT, EV_ALERT_POLL_MINUTES, NIGHTLY_RECAP_HOUR_UTC, EV_DB_PATH)
