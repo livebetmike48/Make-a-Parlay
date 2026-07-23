@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 import parlay
 import statcast_api
 import odds_api
+import ev_features
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -136,6 +137,12 @@ class ParlayBot(discord.Client):
             callback=self._strikeouts_callback,
         )
         self.tree.add_command(k_cmd)
+
+        # Bot Cooks merge: nightly EV pick + grading + live EV commands
+        # (/setevchannel, /topev, /evcheck, /evrecord, /postevpick).
+        # Fully self-contained module -- own Odds API calls, own sqlite
+        # ledger, zero coupling to the parlay code above.
+        ev_features.register_commands(self.tree)
 
         try:
             guild_id = os.getenv("GUILD_ID")
@@ -624,6 +631,7 @@ class ParlayBot(discord.Client):
 
     async def on_ready(self):
         log.info("Logged in as %s", self.user)
+        ev_features.start_tasks(self)
 
 
 client = ParlayBot()
