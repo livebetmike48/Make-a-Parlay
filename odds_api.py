@@ -98,6 +98,21 @@ def find_event(events: list[dict], team_a: str, team_b: str) -> dict | None:
     return None
 
 
+
+
+def _fd_link_from_sid(book_title: str, sid: dict | None) -> str | None:
+    """FanDuel links are just addToBetslip?marketId&selectionId -- so when
+    the API returns sids WITHOUT links (common on some prop markets, e.g.
+    batter_home_runs), we can synthesize the link ourselves. FanDuel only;
+    other books' link schemes aren't reconstructable from sids."""
+    if "fanduel" not in _fold(book_title) or not sid:
+        return None
+    m, s = sid.get("market"), sid.get("outcome")
+    if not m or not s:
+        return None
+    return f"https://sportsbook.fanduel.com/addToBetslip?marketId%5B0%5D={m}&selectionId%5B0%5D={s}"
+
+
 def all_prices_and_links(event: dict, market_key: str, outcome_name: str, point=None) -> tuple[dict, dict, dict]:
     """({book: price}, {book: link}, {book: sids}) for one outcome. If
     `point` is given (totals), only outcomes at that point qualify."""
@@ -114,10 +129,12 @@ def all_prices_and_links(event: dict, market_key: str, outcome_name: str, point=
                 if name and (name in target or target in name):
                     title = book.get("title", "?")
                     prices[title] = outcome.get("price")
-                    link = _clean_link(outcome.get("link") or market.get("link") or book.get("link"))
+                    sid = {"market": market.get("sid"), "outcome": outcome.get("sid")}
+                    sids[title] = sid
+                    link = _clean_link(outcome.get("link") or market.get("link") or book.get("link")
+                                       or _fd_link_from_sid(title, sid))
                     if link:
                         links[title] = link
-                    sids[title] = {"market": market.get("sid"), "outcome": outcome.get("sid")}
     return prices, links, sids
 
 
@@ -291,10 +308,12 @@ def player_prop_prices(event_data: dict, market_key: str, player_name: str) -> d
                 bucket = by_point.setdefault(pt, {"prices": {}, "links": {}, "sids": {}})
                 title = book.get("title", "?")
                 bucket["prices"][title] = outcome.get("price")
-                link = _clean_link(outcome.get("link") or market.get("link") or book.get("link"))
+                sid = {"market": market.get("sid"), "outcome": outcome.get("sid")}
+                bucket["sids"][title] = sid
+                link = _clean_link(outcome.get("link") or market.get("link") or book.get("link")
+                                   or _fd_link_from_sid(title, sid))
                 if link:
                     bucket["links"][title] = link
-                bucket["sids"][title] = {"market": market.get("sid"), "outcome": outcome.get("sid")}
     if not by_point:
         return None
     # Hits/HR: want the 0.5 line when present; otherwise most-quoted point
@@ -303,6 +322,10 @@ def player_prop_prices(event_data: dict, market_key: str, player_name: str) -> d
     else:
         point = max(by_point, key=lambda p: len(by_point[p]["prices"]))
     chosen = by_point[point]
+    if chosen["prices"] and not chosen["links"]:
+        log.info("props %s: %d books priced but ZERO links/synthesizable sids "
+                 "(books: %s) -- buttons will be absent for this leg",
+                 market_key, len(chosen["prices"]), sorted(chosen["prices"]))
     return {"point": point, "prices": chosen["prices"], "links": chosen["links"], "sids": chosen["sids"]}
 
 
