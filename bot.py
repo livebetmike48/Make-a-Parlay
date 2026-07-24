@@ -57,9 +57,37 @@ def parlay_ticket(priced_legs: list, same_game: bool, verb: str = "Parlay",
     honestly: per-leg best-price buttons instead of silence."""
     by_book = odds_api.parlay_by_book(priced_legs)
     if not by_book:
+        # No book covers EVERY leg. Build the biggest PARTIAL parlay we can
+        # at the best-covering book, singles only for the stragglers --
+        # a parlay ask deserves a parlay answer, honestly labeled.
+        def _name(i):
+            return leg_names[i] if leg_names and i < len(leg_names) else f"Leg {i + 1}"
+        coverage = {}
+        for i, p in enumerate(priced_legs):
+            for bk in (p or {}).get("prices") or {}:
+                coverage.setdefault(bk, []).append(i)
         buttons = []
+        covered_idx = set()
+        best_bk = max(coverage, key=lambda bk: (len(coverage[bk]),
+                      "fanduel" in bk.lower()), default=None)
+        if best_bk and len(coverage[best_bk]) >= 2:
+            idxs = coverage[best_bk]
+            legs_sub = [{"sid": ((priced_legs[i].get("sids") or {}).get(best_bk)),
+                         "link": ((priced_legs[i].get("links") or {}).get(best_bk))}
+                        for i in idxs]
+            slip = odds_api.build_slip_link(best_bk, legs_sub)
+            if slip:
+                dec = 1.0
+                for i in idxs:
+                    dec *= odds_api.american_to_decimal(priced_legs[i]["prices"][best_bk])
+                combined = odds_api.decimal_to_american(dec)
+                buttons.append((f"{len(idxs)}/{len(priced_legs)} legs @ {best_bk} "
+                                f"{combined:+d} — partial slip", slip))
+                covered_idx = set(idxs)
         unpriced = 0
-        for i, p in enumerate(priced_legs, 1):
+        for i, p in enumerate(priced_legs):
+            if i in covered_idx:
+                continue
             if not p or not p.get("prices"):
                 unpriced += 1
                 continue
@@ -67,15 +95,20 @@ def parlay_ticket(priced_legs: list, same_game: bool, verb: str = "Parlay",
             if not bp:
                 unpriced += 1
                 continue
-            name = (leg_names[i - 1] if leg_names and i <= len(leg_names) else f"Leg {i}")
             url = (p.get("links") or {}).get(bp[0]) or next(iter((p.get("links") or {}).values()), None)
             if url:
-                buttons.append((f"{name} {bp[1]:+d} @ {bp[0]}", url))
+                buttons.append((f"{_name(i)} {bp[1]:+d} @ {bp[0]}", url))
         if not buttons:
             return "", []
-        header = ("🎟️ **No single book prices every leg** — best price per leg below; "
-                  "add them to your slip one at a time"
-                  + (f" ({unpriced} leg(s) unpriced right now)" if unpriced else "") + "\n\n")
+        if covered_idx:
+            header = (f"🎟️ **No single book prices every leg** — biggest buildable slip is "
+                      f"**{len(covered_idx)}/{len(priced_legs)} legs @ {best_bk}**; "
+                      "remaining legs below at their best price"
+                      + (f" ({unpriced} unpriced right now)" if unpriced else "") + "\n\n")
+        else:
+            header = ("🎟️ **No single book prices every leg** — best price per leg below; "
+                      "add them to your slip one at a time"
+                      + (f" ({unpriced} leg(s) unpriced right now)" if unpriced else "") + "\n\n")
         return header, buttons[:25]
     slips = odds_api.parlay_slips(priced_legs, by_book)
     if same_game:
