@@ -48,13 +48,35 @@ def _leg_lines(leg: dict, market: str) -> str:
     return "\n".join(lines)
 
 
-def parlay_ticket(priced_legs: list, same_game: bool, verb: str = "Parlay") -> tuple[str, list]:
+def parlay_ticket(priced_legs: list, same_game: bool, verb: str = "Parlay",
+                  leg_names: list | None = None) -> tuple[str, list]:
     """The ticket treatment every command shares: exact combined price in
     the header for cross-game parlays (real math), NO number for same-game
-    (only the book knows its SGP price), and full-slip/build-slip buttons."""
+    (only the book knows its SGP price), and full-slip/build-slip buttons.
+    When NO single book prices every leg (common on HR props), degrade
+    honestly: per-leg best-price buttons instead of silence."""
     by_book = odds_api.parlay_by_book(priced_legs)
     if not by_book:
-        return "", []
+        buttons = []
+        unpriced = 0
+        for i, p in enumerate(priced_legs, 1):
+            if not p or not p.get("prices"):
+                unpriced += 1
+                continue
+            bp = odds_api.best_price(p["prices"])
+            if not bp:
+                unpriced += 1
+                continue
+            name = (leg_names[i - 1] if leg_names and i <= len(leg_names) else f"Leg {i}")
+            url = (p.get("links") or {}).get(bp[0]) or next(iter((p.get("links") or {}).values()), None)
+            if url:
+                buttons.append((f"{name} {bp[1]:+d} @ {bp[0]}", url))
+        if not buttons:
+            return "", []
+        header = ("🎟️ **No single book prices every leg** — best price per leg below; "
+                  "add them to your slip one at a time"
+                  + (f" ({unpriced} leg(s) unpriced right now)" if unpriced else "") + "\n\n")
+        return header, buttons[:25]
     slips = odds_api.parlay_slips(priced_legs, by_book)
     if same_game:
         header = "🎟️ **Same-game parlay** — tap a book below to load the full slip; the book shows its exact SGP price there\n\n"
@@ -271,7 +293,8 @@ class ParlayBot(discord.Client):
         for leg in chosen:
             priced_legs.append(leg.get("_priced") or await asyncio.to_thread(_price_leg, leg))
         same_game = len({game_of.get(id(l)) for l in chosen}) < len(chosen)
-        header, bet_buttons = parlay_ticket(priced_legs, same_game)
+        header, bet_buttons = parlay_ticket(
+            priced_legs, same_game, leg_names=[l["batter"] for l in chosen])
 
         embed = discord.Embed(title=f"{cfg['title']} — {len(chosen)} legs", color=discord.Color.gold())
         embed.description = header + cfg["note"] + " • best legs win, any game"
