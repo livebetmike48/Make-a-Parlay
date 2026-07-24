@@ -710,7 +710,7 @@ class ParlayBot(discord.Client):
                 else:
                     await interaction.followup.send("No moneyline legs have live prices right now.")
                 return
-        chosen = parlay.pick_legs(evaluated, game_of, legs, max_per_game=1)
+        chosen = parlay.pick_legs(diversify(evaluated, legs), game_of, legs, max_per_game=1)
 
         priced_legs = []
         for leg in chosen:
@@ -720,7 +720,14 @@ class ParlayBot(discord.Client):
                 priced_legs.append({"prices": prices, "links": links, "sids": sids} if prices else None)
             else:
                 priced_legs.append(None)
-        header, bet_buttons = parlay_ticket(priced_legs, same_game=False)
+        header, bet_buttons = parlay_ticket(priced_legs, same_game=False,
+                                            leg_names=[l["pick_team"] for l in chosen])
+        _track("moneyline", chosen, priced_legs, header,
+               lambda leg, priced: {"kind": "moneyline", "name": leg["pick_team"],
+                                    "team": leg["pick_team"],
+                                    "game_pk": game_of.get(id(leg)),
+                                    "point": None, "side": "win"},
+               interaction)
 
         embed = discord.Embed(title=f"💰 Moneyline Parlay — {len(chosen)} legs", color=discord.Color.green())
         embed.description = header + "ranked by real starter xwOBA-against gap • one leg per game"
@@ -792,7 +799,13 @@ class ParlayBot(discord.Client):
                         if prices:
                             priced = {"prices": prices, "links": links, "sids": sids}
             priced_legs.append(priced)
-        header, bet_buttons = parlay_ticket(priced_legs, same_game=False, verb=f"{side_name}s parlay")
+        header, bet_buttons = parlay_ticket(priced_legs, same_game=False, verb=f"{side_name}s parlay",
+                                            leg_names=[f"{side_name} {l.get('_point')}" for l in chosen])
+        _track("totals", chosen, priced_legs, header,
+               lambda leg, priced: {"kind": "total", "name": f"{side_name} {leg.get('_point')}",
+                                    "team": None, "game_pk": game_of.get(id(leg)),
+                                    "point": leg.get("_point"), "side": side_name.lower()},
+               interaction)
         if header:
             embed.description = header + embed.description
 
