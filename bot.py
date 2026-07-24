@@ -367,43 +367,43 @@ class ParlayBot(discord.Client):
             props = odds_api.get_event_props(ev.get("id"), market_key)
             return odds_api.player_prop_prices(props, market_key, leg["batter"]) if props else None
 
-        if min_odds is not None or max_odds is not None:
-            filtered = []
-            seen_prices = []
-            for leg in evaluated:
-                priced = await asyncio.to_thread(_price_leg, leg)
-                bp = odds_api.best_price(priced["prices"]) if priced else None
-                if bp is None:
-                    continue
-                seen_prices.append(bp[1])
-                if min_odds is not None and bp[1] < min_odds:
-                    continue
-                if max_odds is not None and bp[1] > max_odds:
-                    continue
-                leg["_priced"] = priced
-                filtered.append(leg)
-            evaluated = filtered
-            if not evaluated:
+        # PRICE-GATE FIRST: a player only makes a parlay if a book is
+        # actually offering his prop right now. This drops injured/benched/
+        # unlisted players (e.g. an out star the season stats still love)
+        # BEFORE selection, so we never post a leg you can't bet.
+        priced_pool = []
+        seen_prices = []
+        for leg in evaluated:
+            priced = await asyncio.to_thread(_price_leg, leg)
+            bp = odds_api.best_price(priced["prices"]) if priced else None
+            if bp is None:
+                continue  # no live price -> not a real, bettable leg
+            if min_odds is not None and bp[1] < min_odds:
+                seen_prices.append(bp[1]); continue
+            if max_odds is not None and bp[1] > max_odds:
+                seen_prices.append(bp[1]); continue
+            seen_prices.append(bp[1])
+            leg["_priced"] = priced
+            priced_pool.append(leg)
+        evaluated = priced_pool
+        if not evaluated:
+            if min_odds is not None or max_odds is not None:
                 if seen_prices:
                     lo, hi = min(seen_prices), max(seen_prices)
                     await interaction.followup.send(
-                        f"No legs fit that odds range — the {len(seen_prices)} priced legs today ran "
-                        f"**{lo:+d} to {hi:+d}**. Widen the range (or drop min/max) to see them. "
-                        f"Heads up: hit props on top hitters usually live around -250 to -400."
-                    )
-                else:
-                    await interaction.followup.send(
-                        "No legs have live prices right now — props are unposted or suspended "
-                        "(books pull props once games go live; tonight's lines post closer to game time)."
-                    )
-                return
+                        f"No legs fit that odds range — priced legs today ran "
+                        f"**{lo:+d} to {hi:+d}**. Widen the range (or drop min/max). "
+                        f"Heads up: hit props on top hitters usually live around -250 to -400.")
+                    return
+            await interaction.followup.send(
+                "No legs have live prices right now — props are unposted or suspended "
+                "(books pull props once games go live; lines post closer to game time).")
+            return
 
         chosen = parlay.pick_legs(diversify(evaluated, legs), game_of, legs)
 
-        # Price every leg, then the PARLAY per book (only books carrying all legs)
-        priced_legs = []
-        for leg in chosen:
-            priced_legs.append(leg.get("_priced") or await asyncio.to_thread(_price_leg, leg))
+        # Every chosen leg already carries its live price from the gate above
+        priced_legs = [leg.get("_priced") for leg in chosen]
         same_game = len({game_of.get(id(l)) for l in chosen}) < len(chosen)
         header, bet_buttons = parlay_ticket(
             priced_legs, same_game, leg_names=[l["batter"] for l in chosen])
@@ -461,19 +461,36 @@ class ParlayBot(discord.Client):
             await interaction.followup.send("No probable starters with enough data yet -- try closer to game time.")
             return
 
-        chosen = parlay.pick_legs(diversify(evaluated, legs), game_of, legs)
         game_names = {g["game_pk"]: (g["teams"]["home"]["name"], g["teams"]["away"]["name"]) for g in slate}
         events = await asyncio.to_thread(odds_api.get_events)
 
+        def _price_k_leg(leg):
+            names = game_names.get(game_of.get(id(leg)))
+            if not names or not events:
+                return None
+            ev = odds_api.find_event(events, names[0], names[1])
+            if not ev:
+                return None
+            props = odds_api.get_event_props(ev.get("id"), "pitcher_strikeouts")
+            return odds_api.player_prop_prices(props, "pitcher_strikeouts", leg["starter"]) if props else None
+
+        # Price-gate: only starters with a live K prop qualify (drops
+        # scratched/unlisted arms the season stats still rate highly)
+        gated = []
+        for leg in evaluated:
+            priced = await asyncio.to_thread(_price_k_leg, leg)
+            if priced and odds_api.best_price(priced["prices"]):
+                leg["_priced"] = priced
+                gated.append(leg)
+        if not gated:
+            await interaction.followup.send(
+                "Starters found, but none have a live strikeouts prop right now "
+                "(K props post closer to game time).")
+            return
+        chosen = parlay.pick_legs(diversify(gated, legs), game_of, legs)
         priced_legs, k_lines = [], {}
         for leg in chosen:
-            priced = None
-            names = game_names.get(game_of.get(id(leg)))
-            if names and events:
-                ev = odds_api.find_event(events, names[0], names[1])
-                if ev:
-                    props = await asyncio.to_thread(odds_api.get_event_props, ev.get("id"), "pitcher_strikeouts")
-                    priced = odds_api.player_prop_prices(props, "pitcher_strikeouts", leg["starter"]) if props else None
+            priced = leg.get("_priced")
             priced_legs.append(priced)
             if priced:
                 k_lines[id(leg)] = priced["point"]
@@ -528,8 +545,6 @@ class ParlayBot(discord.Client):
             )
             return
 
-        chosen = parlay.pick_legs(diversify(legs_found, legs), game_of, legs)
-
         game_names = {g["game_pk"]: (g["teams"]["home"]["name"], g["teams"]["away"]["name"]) for g in slate}
         events = await asyncio.to_thread(odds_api.get_events)
 
@@ -543,9 +558,20 @@ class ParlayBot(discord.Client):
             props = odds_api.get_event_props(ev.get("id"), "batter_hits")
             return odds_api.player_prop_prices(props, "batter_hits", leg["batter"]) if props else None
 
-        priced_legs = []
-        for leg in chosen:
-            priced_legs.append(await asyncio.to_thread(_price_streak_leg, leg))
+        # Price-gate: only streak hitters with a live hits prop qualify
+        gated = []
+        for leg in legs_found:
+            priced = await asyncio.to_thread(_price_streak_leg, leg)
+            if priced and odds_api.best_price(priced["prices"]):
+                leg["_priced"] = priced
+                gated.append(leg)
+        if not gated:
+            await interaction.followup.send(
+                "Streak hitters found, but none have a live hits prop right now "
+                "(props post closer to game time).")
+            return
+        chosen = parlay.pick_legs(diversify(gated, legs), game_of, legs)
+        priced_legs = [leg.get("_priced") for leg in chosen]
         same_game = len({game_of.get(id(l)) for l in chosen}) < len(chosen)
         header, bet_buttons = parlay_ticket(priced_legs, same_game,
                                             leg_names=[l["batter"] for l in chosen])
@@ -685,31 +711,31 @@ class ParlayBot(discord.Client):
             return
 
         odds_events = await asyncio.to_thread(odds_api.get_mlb_odds, "h2h")
-        if odds_events and (min_odds is not None or max_odds is not None):
-            filtered = []
-            seen_prices = []
-            for leg in evaluated:
-                event = odds_api.find_event(odds_events, leg["pick_team"], leg["opp_team"])
-                bp = odds_api.best_price(odds_api.all_prices(event, "h2h", leg["pick_team"])) if event else None
-                if bp is None:
-                    continue
-                seen_prices.append(bp[1])
-                if min_odds is not None and bp[1] < min_odds:
-                    continue
-                if max_odds is not None and bp[1] > max_odds:
-                    continue
-                filtered.append(leg)
-            evaluated = filtered
-            if not evaluated:
-                if seen_prices:
-                    lo, hi = min(seen_prices), max(seen_prices)
-                    await interaction.followup.send(
-                        f"No moneyline legs fit that odds range — the {len(seen_prices)} priced legs today ran "
-                        f"**{lo:+d} to {hi:+d}**. Widen the range (or drop min/max) to see them."
-                    )
-                else:
-                    await interaction.followup.send("No moneyline legs have live prices right now.")
-                return
+        # Price-gate: a moneyline leg must have a live h2h price (drops
+        # games with no market up yet); also applies any odds filter.
+        filtered = []
+        seen_prices = []
+        for leg in evaluated:
+            event = odds_api.find_event(odds_events, leg["pick_team"], leg["opp_team"]) if odds_events else None
+            bp = odds_api.best_price(odds_api.all_prices(event, "h2h", leg["pick_team"])) if event else None
+            if bp is None:
+                continue
+            seen_prices.append(bp[1])
+            if min_odds is not None and bp[1] < min_odds:
+                continue
+            if max_odds is not None and bp[1] > max_odds:
+                continue
+            filtered.append(leg)
+        evaluated = filtered
+        if not evaluated:
+            if seen_prices and (min_odds is not None or max_odds is not None):
+                lo, hi = min(seen_prices), max(seen_prices)
+                await interaction.followup.send(
+                    f"No moneyline legs fit that odds range — priced legs today ran "
+                    f"**{lo:+d} to {hi:+d}**. Widen the range (or drop min/max).")
+            else:
+                await interaction.followup.send("No moneyline legs have live prices right now.")
+            return
         chosen = parlay.pick_legs(diversify(evaluated, legs), game_of, legs, max_per_game=1)
 
         priced_legs = []
