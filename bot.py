@@ -13,6 +13,7 @@ import parlay
 import statcast_api
 import odds_api
 import ev_features
+import parlay_track
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -66,24 +67,49 @@ def parlay_ticket(priced_legs: list, same_game: bool, verb: str = "Parlay",
         for i, p in enumerate(priced_legs):
             for bk in (p or {}).get("prices") or {}:
                 coverage.setdefault(bk, []).append(i)
+        multi = {bk: idxs for bk, idxs in coverage.items() if len(idxs) >= 2}
+
+        def _combined(bk, idxs):
+            dec = 1.0
+            for i in idxs:
+                dec *= odds_api.american_to_decimal(priced_legs[i]["prices"][bk])
+            return odds_api.decimal_to_american(dec)
+
+        # Prefer the book that parlays the MOST legs; among ties, the one
+        # with a one-tap slip (FanDuel/DK), then the better combined price.
+        best_bk, best_idxs, best_slip = None, [], None
+        for bk, idxs in sorted(multi.items(), key=lambda kv: -len(kv[1])):
+            legs_sub = [{"sid": ((priced_legs[i].get("sids") or {}).get(bk)),
+                         "link": ((priced_legs[i].get("links") or {}).get(bk))}
+                        for i in idxs]
+            slip = odds_api.build_slip_link(bk, legs_sub)
+            better = (best_bk is None
+                      or len(idxs) > len(best_idxs)
+                      or (len(idxs) == len(best_idxs) and slip and not best_slip)
+                      or (len(idxs) == len(best_idxs) and bool(slip) == bool(best_slip)
+                          and _combined(bk, idxs) > _combined(best_bk, best_idxs)))
+            if better:
+                best_bk, best_idxs, best_slip = bk, idxs, slip
+
         buttons = []
         covered_idx = set()
-        best_bk = max(coverage, key=lambda bk: (len(coverage[bk]),
-                      "fanduel" in bk.lower()), default=None)
-        if best_bk and len(coverage[best_bk]) >= 2:
-            idxs = coverage[best_bk]
-            legs_sub = [{"sid": ((priced_legs[i].get("sids") or {}).get(best_bk)),
-                         "link": ((priced_legs[i].get("links") or {}).get(best_bk))}
-                        for i in idxs]
-            slip = odds_api.build_slip_link(best_bk, legs_sub)
-            if slip:
-                dec = 1.0
-                for i in idxs:
-                    dec *= odds_api.american_to_decimal(priced_legs[i]["prices"][best_bk])
-                combined = odds_api.decimal_to_american(dec)
-                buttons.append((f"{len(idxs)}/{len(priced_legs)} legs @ {best_bk} "
-                                f"{combined:+d} — partial slip", slip))
-                covered_idx = set(idxs)
+        if best_bk:
+            covered_idx = set(best_idxs)
+            combined = _combined(best_bk, best_idxs)
+            label = f"{len(best_idxs)}/{len(priced_legs)} legs @ {best_bk} {combined:+d}"
+            if best_slip:
+                buttons.append((f"{label} — partial slip", best_slip))
+            else:
+                # No one-tap scheme at this book (Caesars/BetRivers/etc):
+                # give each leg's link AT THAT BOOK so taps land in ONE slip.
+                for i in best_idxs:
+                    url = (priced_legs[i].get("links") or {}).get(best_bk)
+                    if url:
+                        buttons.append((f"{_name(i)} {priced_legs[i]['prices'][best_bk]:+d} "
+                                        f"@ {best_bk}", url))
+                if not any(b for b in buttons):
+                    covered_idx = set()
+
         unpriced = 0
         for i, p in enumerate(priced_legs):
             if i in covered_idx:
@@ -100,15 +126,23 @@ def parlay_ticket(priced_legs: list, same_game: bool, verb: str = "Parlay",
                 buttons.append((f"{_name(i)} {bp[1]:+d} @ {bp[0]}", url))
         if not buttons:
             return "", []
-        if covered_idx:
-            header = (f"🎟️ **No single book prices every leg** — biggest buildable slip is "
-                      f"**{len(covered_idx)}/{len(priced_legs)} legs @ {best_bk}**; "
-                      "remaining legs below at their best price"
-                      + (f" ({unpriced} unpriced right now)" if unpriced else "") + "\n\n")
+        if covered_idx and best_slip:
+            header = (f"🎟️ **No single book prices every leg** — biggest parlay is "
+                      f"**{len(covered_idx)}/{len(priced_legs)} legs @ {best_bk} "
+                      f"{_combined(best_bk, best_idxs):+d}** (one tap loads them all); "
+                      "any leftover leg below at its best price"
+                      + (f" · {unpriced} unpriced right now" if unpriced else "") + "\n\n")
+        elif covered_idx:
+            header = (f"🎟️ **No single book prices every leg** — biggest parlay is "
+                      f"**{len(covered_idx)}/{len(priced_legs)} legs @ {best_bk} "
+                      f"{_combined(best_bk, best_idxs):+d}**. {best_bk} has no one-tap slip link, "
+                      "so tap each leg below (they land in the same slip); "
+                      "leftovers after that are separate bets"
+                      + (f" · {unpriced} unpriced right now" if unpriced else "") + "\n\n")
         else:
-            header = ("🎟️ **No single book prices every leg** — best price per leg below; "
-                      "add them to your slip one at a time"
-                      + (f" ({unpriced} leg(s) unpriced right now)" if unpriced else "") + "\n\n")
+            header = ("🎟️ **No single book prices every leg** — and no book prices two of them "
+                      "together, so these can only be singles right now"
+                      + (f" ({unpriced} leg(s) unpriced)" if unpriced else "") + "\n\n")
         return header, buttons[:25]
     slips = odds_api.parlay_slips(priced_legs, by_book)
     if same_game:
@@ -127,6 +161,50 @@ def parlay_ticket(priced_legs: list, same_game: bool, verb: str = "Parlay",
             label = f"{bk} (build slip)" if same_game else f"{bk} {by_book[bk]['combined']:+d} (build slip)"
         buttons.append((label, url))
     return header, buttons[:5]
+
+
+import random
+
+
+def diversify(evaluated: list, want: int) -> list:
+    """Same data, different ticket. The top of the shortlist is a cluster of
+    near-equal candidates -- always taking 1..N means every user gets the
+    same parlay. Weighted-shuffle the top pool (better rank = better odds of
+    being picked) so tickets rotate WITHOUT dipping into worse legs: the
+    pool is capped at the top 3x, and everything below stays in rank order
+    as backup for pick_legs' game-diversity rules."""
+    pool_size = min(len(evaluated), max(want * 3, want + 4))
+    pool = list(evaluated[:pool_size])
+    rest = evaluated[pool_size:]
+    picked = []
+    while pool:
+        weights = [1.0 / (i + 1.5) for i in range(len(pool))]
+        idx = random.choices(range(len(pool)), weights=weights, k=1)[0]
+        picked.append(pool.pop(idx))
+    return picked + rest
+
+
+def _track(category: str, chosen: list, priced_legs: list, header: str,
+           kind_of, interaction, game_of=None):
+    """Record the posted parlay at 1U. Best-effort: never breaks a command."""
+    try:
+        by_book = odds_api.parlay_by_book(priced_legs)
+        if not by_book:
+            return
+        book = max(by_book, key=lambda bk: by_book[bk]["combined"])
+        price = by_book[book]["combined"]
+        legs = []
+        for leg, priced in zip(chosen, priced_legs):
+            spec = kind_of(leg, priced)
+            if not spec:
+                return
+            spec.setdefault("price", (priced or {}).get("prices", {}).get(book))
+            spec.setdefault("book", book)
+            legs.append(spec)
+        parlay_track.record(category, legs, price, book,
+                            requested_by=str(getattr(interaction.user, "id", "")))
+    except Exception as e:
+        log.warning("parlay tracking skipped: %s", e)
 
 
 def build_bet_buttons(leg_links: list[tuple[str, str]]) -> discord.ui.View | None:
@@ -198,6 +276,7 @@ class ParlayBot(discord.Client):
         # Fully self-contained module -- own Odds API calls, own sqlite
         # ledger, zero coupling to the parlay code above.
         ev_features.register_commands(self.tree)
+        parlay_track.register_commands(self.tree)
 
         try:
             guild_id = os.getenv("GUILD_ID")
@@ -319,7 +398,7 @@ class ParlayBot(discord.Client):
                     )
                 return
 
-        chosen = parlay.pick_legs(evaluated, game_of, legs)
+        chosen = parlay.pick_legs(diversify(evaluated, legs), game_of, legs)
 
         # Price every leg, then the PARLAY per book (only books carrying all legs)
         priced_legs = []
@@ -328,6 +407,13 @@ class ParlayBot(discord.Client):
         same_game = len({game_of.get(id(l)) for l in chosen}) < len(chosen)
         header, bet_buttons = parlay_ticket(
             priced_legs, same_game, leg_names=[l["batter"] for l in chosen])
+        _track("hr" if market == "hr" else "hit", chosen, priced_legs, header,
+               lambda leg, priced: {
+                   "kind": "batter_hr" if market == "hr" else "batter_hit",
+                   "name": leg["batter"], "team": leg.get("team"),
+                   "game_pk": game_of.get(id(leg)),
+                   "point": (priced or {}).get("point", 0.5), "side": "over"},
+               interaction)
 
         embed = discord.Embed(title=f"{cfg['title']} — {len(chosen)} legs", color=discord.Color.gold())
         embed.description = header + cfg["note"] + " • best legs win, any game"
@@ -375,7 +461,7 @@ class ParlayBot(discord.Client):
             await interaction.followup.send("No probable starters with enough data yet -- try closer to game time.")
             return
 
-        chosen = parlay.pick_legs(evaluated, game_of, legs)
+        chosen = parlay.pick_legs(diversify(evaluated, legs), game_of, legs)
         game_names = {g["game_pk"]: (g["teams"]["home"]["name"], g["teams"]["away"]["name"]) for g in slate}
         events = await asyncio.to_thread(odds_api.get_events)
 
@@ -392,7 +478,14 @@ class ParlayBot(discord.Client):
             if priced:
                 k_lines[id(leg)] = priced["point"]
         same_game = len({game_of.get(id(l)) for l in chosen}) < len(chosen)
-        header, bet_buttons = parlay_ticket(priced_legs, same_game, verb="Overs parlay")
+        header, bet_buttons = parlay_ticket(priced_legs, same_game, verb="Overs parlay",
+                                           leg_names=[l["starter"] for l in chosen])
+        _track("k", chosen, priced_legs, header,
+               lambda leg, priced: {"kind": "pitcher_k", "name": leg["starter"],
+                                    "team": leg.get("team"),
+                                    "game_pk": game_of.get(id(leg)),
+                                    "point": (priced or {}).get("point"), "side": "over"},
+               interaction)
 
         embed = discord.Embed(title=f"⚔️ Strikeouts Parlay — {len(chosen)} legs", color=discord.Color.red())
         embed.description = header + "ranked by real K% vs either side"
@@ -435,7 +528,7 @@ class ParlayBot(discord.Client):
             )
             return
 
-        chosen = parlay.pick_legs(legs_found, game_of, legs)
+        chosen = parlay.pick_legs(diversify(legs_found, legs), game_of, legs)
 
         game_names = {g["game_pk"]: (g["teams"]["home"]["name"], g["teams"]["away"]["name"]) for g in slate}
         events = await asyncio.to_thread(odds_api.get_events)
@@ -454,7 +547,14 @@ class ParlayBot(discord.Client):
         for leg in chosen:
             priced_legs.append(await asyncio.to_thread(_price_streak_leg, leg))
         same_game = len({game_of.get(id(l)) for l in chosen}) < len(chosen)
-        header, bet_buttons = parlay_ticket(priced_legs, same_game)
+        header, bet_buttons = parlay_ticket(priced_legs, same_game,
+                                            leg_names=[l["batter"] for l in chosen])
+        _track("streak", chosen, priced_legs, header,
+               lambda leg, priced: {"kind": "batter_hit", "name": leg["batter"],
+                                    "team": leg.get("team"),
+                                    "game_pk": game_of.get(id(leg)),
+                                    "point": (priced or {}).get("point", 0.5), "side": "over"},
+               interaction)
 
         embed = discord.Embed(title=f"🔥 Streak Parlay — {len(chosen)} legs (streaks of {min_streak}+)", color=discord.Color.orange())
         embed.description = header + "each leg = hitter to extend their ACTIVE hit streak • ranked by streak length"
@@ -531,6 +631,13 @@ class ParlayBot(discord.Client):
         for kind, leg in chosen:
             priced_legs.append(await asyncio.to_thread(_price_sgp_leg, kind, leg))
         header, bet_buttons = parlay_ticket(priced_legs, same_game=True)
+        _track("sgp", chosen, priced_legs, header,
+               lambda pair, priced: {
+                   "kind": "pitcher_k" if pair[0] == "k" else "batter_hit",
+                   "name": pair[1].get("starter") if pair[0] == "k" else pair[1].get("batter"),
+                   "team": pair[1].get("team"), "game_pk": target,
+                   "point": (priced or {}).get("point", 0.5), "side": "over"},
+               interaction)
 
         embed = discord.Embed(title=f"🎰 Same Game Parlay — {matchup}", color=discord.Color.purple())
         embed.description = header + "structure: best strikeouts leg + top hit legs (xBA vs hand) • all one game"
@@ -710,6 +817,7 @@ class ParlayBot(discord.Client):
     async def on_ready(self):
         log.info("Logged in as %s", self.user)
         ev_features.start_tasks(self)
+        parlay_track.start_tasks(self)
 
 
 client = ParlayBot()
