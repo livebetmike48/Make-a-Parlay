@@ -332,11 +332,32 @@ def parlay_by_book(priced_legs: list[dict]) -> dict:
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, quote
 
 
+def _fd_ids_from_link(url) -> tuple[str | None, str | None]:
+    """FanDuel's own per-outcome links from The Odds API are addToBetslip
+    URLs carrying the ids we need (marketId[0]/selectionId[0], sometimes
+    unindexed). When the API omits sids -- common for US books -- the leg's
+    link still tells us the ids, so multi-leg slips stay buildable."""
+    if not url or "fanduel" not in url.lower():
+        return None, None
+    try:
+        q = parse_qs(urlparse(url).query)
+    except ValueError:
+        return None, None
+    def first(*keys):
+        for k in keys:
+            if q.get(k):
+                return q[k][0]
+        return None
+    return (first("marketId[0]", "marketId", "marketid[0]", "marketid"),
+            first("selectionId[0]", "selectionId", "selectionid[0]", "selectionid"))
+
+
 def build_slip_link(book_title: str, legs: list[dict]) -> str | None:
     """A single URL that loads ALL legs into the book's betslip, using the
-    bookmaker's own ids (sids). Formats are the community-known ones that
-    odds tools use -- unofficial, so anything unbuildable returns None and
-    callers fall back to single-leg links."""
+    bookmaker's own ids (sids), or -- for FanDuel -- ids recovered from the
+    per-leg links when the API omits sids. Formats are the community-known
+    ones that odds tools use -- unofficial, so anything unbuildable returns
+    None and callers fall back to single-leg links."""
     folded = _fold(book_title)
     if "fanduel" in folded:
         # FanDuel addToBetslip supports multiple selections, cross-event
@@ -345,6 +366,10 @@ def build_slip_link(book_title: str, legs: list[dict]) -> str | None:
             sid = (leg or {}).get("sid") or {}
             market_id, selection_id = sid.get("market"), sid.get("outcome")
             if not market_id or not selection_id:
+                market_id, selection_id = _fd_ids_from_link((leg or {}).get("link"))
+            if not market_id or not selection_id:
+                log.info("slip build (FanDuel): leg %d has no sid and no ids in "
+                         "its link -- falling back to single-leg link", i + 1)
                 return None
             params.append((f"marketId[{i}]", market_id))
             params.append((f"selectionId[{i}]", selection_id))
@@ -389,4 +414,8 @@ def parlay_slips(priced_legs: list[dict], by_book: dict) -> dict:
         slip = build_slip_link(book, legs)
         if slip:
             out[book] = _clean_link(slip)
+    built = {k for k, v in out.items() if v}
+    if by_book:
+        log.info("parlay slips: built full-slip links for %s; single-leg fallback for %s",
+                 sorted(built) or "none", sorted(set(by_book) - built) or "none")
     return {k: v for k, v in out.items() if v}
